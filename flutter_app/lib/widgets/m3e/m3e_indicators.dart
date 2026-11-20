@@ -60,30 +60,35 @@ class _M3ELoadingIndicatorState extends State<M3ELoadingIndicator>
     final activeColor = widget.color ?? cs.primary;
     final bgColor = widget.containerColor ?? cs.primaryContainer;
 
-    return SizedBox(
-      width: widget.size,
-      height: widget.size,
-      child: AnimatedBuilder(
-        animation: _ctrl,
-        builder: (context, _) {
-          final scaled = _ctrl.value * _sequence.length;
-          final idx = scaled.floor() % _sequence.length;
-          final nextIdx = (idx + 1) % _sequence.length;
-          final localT = Curves.easeInOutCubicEmphasized.transform(scaled - scaled.floor());
-          final rotation = _ctrl.value * math.pi * 2;
+    return RepaintBoundary(
+      child: SizedBox(
+        width: widget.size,
+        height: widget.size,
+        child: AnimatedBuilder(
+          animation: _ctrl,
+          builder: (context, _) {
+            final scaled = _ctrl.value * _sequence.length;
+            final idx = scaled.floor() % _sequence.length;
+            final nextIdx = (idx + 1) % _sequence.length;
+            final localT = Curves.easeInOutCubicEmphasized
+                .transform(scaled - scaled.floor());
+            final rotation = _ctrl.value * math.pi * 2;
 
-          return CustomPaint(
-            painter: _M3ELoadingPainter(
-              from: _sequence[idx],
-              to: _sequence[nextIdx],
-              t: localT,
-              rotation: rotation,
-              activeColor: activeColor,
-              contained: widget.contained,
-              containerColor: bgColor,
-            ),
-          );
-        },
+            return CustomPaint(
+              isComplex: true,
+              willChange: true,
+              painter: _M3ELoadingPainter(
+                from: _sequence[idx],
+                to: _sequence[nextIdx],
+                t: localT,
+                rotation: rotation,
+                activeColor: activeColor,
+                contained: widget.contained,
+                containerColor: bgColor,
+              ),
+            );
+          },
+        ),
       ),
     );
   }
@@ -219,24 +224,27 @@ class _M3EWavyProgressIndicatorState extends State<M3EWavyProgressIndicator>
     final activeColor = widget.color ?? cs.primary;
     final bgColor = widget.trackColor ?? cs.secondaryContainer;
 
-    return SizedBox(
-      height: widget.height,
-      width: double.infinity,
-      child: AnimatedBuilder(
-        animation: _phaseCtrl,
-        builder: (context, _) {
-          return CustomPaint(
-            painter: _WavyProgressPainter(
-              value: widget.value.clamp(0.0, 1.0),
-              phase: _phaseCtrl.value * math.pi * 2,
-              strokeWidth: widget.strokeWidth,
-              amplitude: widget.amplitude,
-              wavelength: widget.wavelength,
-              activeColor: activeColor,
-              trackColor: bgColor,
-            ),
-          );
-        },
+    return RepaintBoundary(
+      child: SizedBox(
+        height: widget.height,
+        width: double.infinity,
+        child: AnimatedBuilder(
+          animation: _phaseCtrl,
+          builder: (context, _) {
+            return CustomPaint(
+              willChange: widget.animateWave,
+              painter: _WavyProgressPainter(
+                value: widget.value.clamp(0.0, 1.0),
+                phase: _phaseCtrl.value * math.pi * 2,
+                strokeWidth: widget.strokeWidth,
+                amplitude: widget.amplitude,
+                wavelength: widget.wavelength,
+                activeColor: activeColor,
+                trackColor: bgColor,
+              ),
+            );
+          },
+        ),
       ),
     );
   }
@@ -296,7 +304,7 @@ class _WavyProgressPainter extends CustomPainter {
     if (activeEnd > 1) {
       final amp = value >= 0.999 ? 0.0 : amplitude;
       final path = Path();
-      const step = 2.0;
+      const step = 3.0;
       for (double x = strokeWidth / 2; x <= activeEnd; x += step) {
         final y = cy + math.sin((x / wavelength) * math.pi * 2 - phase) * amp;
         if (x == strokeWidth / 2) {
@@ -354,33 +362,35 @@ class M3EProgressRing extends StatelessWidget {
     final typo = M3ETypography.of(context);
     final ratio = total > 0 ? (done / total).clamp(0.0, 1.0) : 0.0;
 
-    final ring = SizedBox(
-      width: 44,
-      height: 44,
-      child: Stack(
-        alignment: Alignment.center,
-        children: [
-          TweenAnimationBuilder<double>(
-            tween: Tween<double>(end: ratio),
-            duration: const Duration(milliseconds: 420),
-            curve: Curves.easeOutCubic,
-            builder: (_, val, __) => CustomPaint(
-              size: const Size(44, 44),
-              painter: _RingPainter(
-                progress: val,
-                color: color,
-                trackColor: cs.surfaceContainerHighest,
+    final ring = RepaintBoundary(
+      child: SizedBox(
+        width: 44,
+        height: 44,
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            TweenAnimationBuilder<double>(
+              tween: Tween<double>(end: ratio),
+              duration: const Duration(milliseconds: 420),
+              curve: Curves.easeOutCubic,
+              builder: (_, val, __) => CustomPaint(
+                size: const Size(44, 44),
+                painter: _RingPainter(
+                  progress: val,
+                  color: color,
+                  trackColor: cs.surfaceContainerHighest,
+                ),
               ),
             ),
-          ),
-          Text(
-            total > 0 ? '$done' : '—',
-            style: typo.emphasized.labelMedium?.copyWith(
-              color: total > 0 ? color : cs.onSurfaceVariant,
-              fontSize: 12,
+            Text(
+              total > 0 ? '$done' : '—',
+              style: typo.emphasized.labelMedium?.copyWith(
+                color: total > 0 ? color : cs.onSurfaceVariant,
+                fontSize: 12,
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
 

@@ -3,6 +3,7 @@ import 'screens/files_workbench_screen.dart';
 import 'screens/study_workspace.dart';
 import 'screens/sync_settings_screen.dart';
 import 'state/app_controller.dart';
+import 'theme/m3e_motion.dart';
 import 'theme/m3e_theme.dart';
 import 'theme/m3e_typography.dart';
 import 'widgets/navigation/m3e_nav_rail.dart';
@@ -27,15 +28,40 @@ class _IR4AnkiDesktopAppState extends State<IR4AnkiDesktopApp> {
   final GlobalKey<ScaffoldMessengerState> _messengerKey = GlobalKey();
   int _lastShownToastEpoch = 0;
 
+  // Cached ThemeData so normal study/file state updates NEVER recompute
+  // Material HCT ColorScheme.fromSeed() or trigger AnimatedTheme across the tree.
+  late ThemeMode _cachedThemeMode;
+  late M3EPalettePreset _cachedPalette;
+  late M3EMotionScheme _cachedMotionScheme;
+  late ThemeData _lightTheme;
+  late ThemeData _darkTheme;
+
   @override
   void initState() {
     super.initState();
     _ownsController = widget.controller == null;
     _controller = widget.controller ?? AppController();
+    _cachedThemeMode = _controller.themeMode;
+    _cachedPalette = _controller.palette;
+    _cachedMotionScheme = _controller.motionScheme;
+    _rebuildThemes();
     _controller.addListener(_onControllerChanged);
     if (_ownsController) {
       _controller.init();
     }
+  }
+
+  void _rebuildThemes() {
+    _lightTheme = buildM3ETheme(
+      brightness: Brightness.light,
+      palette: _cachedPalette,
+      motionScheme: _cachedMotionScheme,
+    );
+    _darkTheme = buildM3ETheme(
+      brightness: Brightness.dark,
+      palette: _cachedPalette,
+      motionScheme: _cachedMotionScheme,
+    );
   }
 
   void _onControllerChanged() {
@@ -54,6 +80,22 @@ class _IR4AnkiDesktopAppState extends State<IR4AnkiDesktopApp> {
           );
       });
     }
+
+    final themeChanged = _controller.themeMode != _cachedThemeMode ||
+        _controller.palette != _cachedPalette ||
+        _controller.motionScheme != _cachedMotionScheme;
+    if (themeChanged && mounted) {
+      setState(() {
+        final needThemeRebuild = _controller.palette != _cachedPalette ||
+            _controller.motionScheme != _cachedMotionScheme;
+        _cachedThemeMode = _controller.themeMode;
+        _cachedPalette = _controller.palette;
+        _cachedMotionScheme = _controller.motionScheme;
+        if (needThemeRebuild) {
+          _rebuildThemes();
+        }
+      });
+    }
   }
 
   @override
@@ -65,27 +107,14 @@ class _IR4AnkiDesktopAppState extends State<IR4AnkiDesktopApp> {
 
   @override
   Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: _controller,
-      builder: (context, _) {
-        return MaterialApp(
-          title: 'IR4Anki',
-          debugShowCheckedModeBanner: false,
-          scaffoldMessengerKey: _messengerKey,
-          themeMode: _controller.themeMode,
-          theme: buildM3ETheme(
-            brightness: Brightness.light,
-            palette: _controller.palette,
-            motionScheme: _controller.motionScheme,
-          ),
-          darkTheme: buildM3ETheme(
-            brightness: Brightness.dark,
-            palette: _controller.palette,
-            motionScheme: _controller.motionScheme,
-          ),
-          home: _DesktopShell(controller: _controller),
-        );
-      },
+    return MaterialApp(
+      title: 'IR4Anki',
+      debugShowCheckedModeBanner: false,
+      scaffoldMessengerKey: _messengerKey,
+      themeMode: _cachedThemeMode,
+      theme: _lightTheme,
+      darkTheme: _darkTheme,
+      home: _DesktopShell(controller: _controller),
     );
   }
 }
@@ -158,21 +187,163 @@ class _DesktopShell extends StatelessWidget {
       body: Row(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          M3ENavigationRail(
-            controller: controller,
-            onQuickSyncTap: () => _openQuickSyncDialog(context),
-          ),
-          Expanded(
-            child: IndexedStack(
-              index: controller.section.index,
-              children: [
-                StudyWorkspace(controller: controller),
-                FilesWorkbenchScreen(controller: controller),
-                SyncSettingsScreen(controller: controller),
-              ],
+          RepaintBoundary(
+            child: ListenableBuilder(
+              listenable: controller,
+              builder: (ctx, _) => M3ENavigationRail(
+                controller: controller,
+                onQuickSyncTap: () => _openQuickSyncDialog(ctx),
+              ),
             ),
           ),
+          Expanded(
+            child: _SectionHost(controller: controller),
+          ),
         ],
+      ),
+    );
+  }
+}
+
+/// Hosts the 3 top-level workspaces while ensuring inactive tabs:
+/// 1. Have `TickerMode(enabled: false)` so no hidden animations tick.
+/// 2. Do NOT rebuild when `AppController` notifies while another tab is active.
+class _SectionHost extends StatefulWidget {
+  const _SectionHost({required this.controller});
+
+  final AppController controller;
+
+  @override
+  State<_SectionHost> createState() => _SectionHostState();
+}
+
+class _SectionHostState extends State<_SectionHost> {
+  late AppSection _activeSection;
+
+  @override
+  void initState() {
+    super.initState();
+    _activeSection = widget.controller.section;
+    widget.controller.addListener(_onChanged);
+  }
+
+  @override
+  void didUpdateWidget(_SectionHost oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller.removeListener(_onChanged);
+      _activeSection = widget.controller.section;
+      widget.controller.addListener(_onChanged);
+    }
+  }
+
+  void _onChanged() {
+    if (widget.controller.section != _activeSection && mounted) {
+      setState(() => _activeSection = widget.controller.section);
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_onChanged);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return IndexedStack(
+      index: _activeSection.index,
+      children: [
+        _ActiveTabGate(
+          controller: widget.controller,
+          isActive: _activeSection == AppSection.study,
+          builder: () => StudyWorkspace(controller: widget.controller),
+        ),
+        _ActiveTabGate(
+          controller: widget.controller,
+          isActive: _activeSection == AppSection.files,
+          builder: () => FilesWorkbenchScreen(controller: widget.controller),
+        ),
+        _ActiveTabGate(
+          controller: widget.controller,
+          isActive: _activeSection == AppSection.syncSettings,
+          builder: () => SyncSettingsScreen(controller: widget.controller),
+        ),
+      ],
+    );
+  }
+}
+
+class _ActiveTabGate extends StatefulWidget {
+  const _ActiveTabGate({
+    required this.controller,
+    required this.isActive,
+    required this.builder,
+  });
+
+  final AppController controller;
+  final bool isActive;
+  final Widget Function() builder;
+
+  @override
+  State<_ActiveTabGate> createState() => _ActiveTabGateState();
+}
+
+class _ActiveTabGateState extends State<_ActiveTabGate> {
+  bool _hasBeenActivated = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _hasBeenActivated = widget.isActive;
+    if (widget.isActive) {
+      widget.controller.addListener(_onControllerUpdate);
+    }
+  }
+
+  @override
+  void didUpdateWidget(_ActiveTabGate oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isActive) {
+      _hasBeenActivated = true;
+    }
+    if (oldWidget.controller != widget.controller) {
+      if (oldWidget.isActive) {
+        oldWidget.controller.removeListener(_onControllerUpdate);
+      }
+      if (widget.isActive) {
+        widget.controller.addListener(_onControllerUpdate);
+      }
+    } else if (oldWidget.isActive != widget.isActive) {
+      if (widget.isActive) {
+        widget.controller.addListener(_onControllerUpdate);
+      } else {
+        widget.controller.removeListener(_onControllerUpdate);
+      }
+    }
+  }
+
+  void _onControllerUpdate() {
+    if (mounted && widget.isActive) {
+      setState(() {});
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_onControllerUpdate);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_hasBeenActivated) {
+      return const SizedBox.shrink();
+    }
+    return RepaintBoundary(
+      child: TickerMode(
+        enabled: widget.isActive,
+        child: widget.builder(),
       ),
     );
   }

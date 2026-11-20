@@ -467,70 +467,95 @@ class _FilesWorkbenchScreenState extends State<FilesWorkbenchScreen> {
                         Expanded(
                           child: ctrl.filesLoading
                               ? const Center(child: M3ELoadingIndicator(size: 44))
-                              : ListView(
-                                  padding: const EdgeInsets.all(10),
-                                  children: [
-                                    // FTS5 Full-text search matches section
+                              : CustomScrollView(
+                                  slivers: [
                                     if (query.length >= 2) ...[
-                                      Padding(
-                                        padding: const EdgeInsets.fromLTRB(6, 2, 6, 8),
-                                        child: Row(
-                                          children: [
-                                            Icon(Icons.manage_search_rounded,
-                                                size: 16, color: cs.primary),
-                                            const SizedBox(width: 6),
-                                            Text(
-                                              ctrl.ftsSearching
-                                                  ? '全文检索中…'
-                                                  : '全文检索匹配（${ctrl.ftsResults.length}）',
-                                              style: typo.emphasized.labelMedium
-                                                  ?.copyWith(color: cs.primary),
-                                            ),
-                                          ],
+                                      SliverPadding(
+                                        padding: const EdgeInsets.fromLTRB(
+                                            16, 12, 16, 8),
+                                        sliver: SliverToBoxAdapter(
+                                          child: Row(
+                                            children: [
+                                              Icon(Icons.manage_search_rounded,
+                                                  size: 16, color: cs.primary),
+                                              const SizedBox(width: 6),
+                                              Text(
+                                                ctrl.ftsSearching
+                                                    ? '全文检索中…'
+                                                    : '全文检索匹配（${ctrl.ftsResults.length}）',
+                                                style: typo.emphasized
+                                                    .labelMedium
+                                                    ?.copyWith(
+                                                        color: cs.primary),
+                                              ),
+                                            ],
+                                          ),
                                         ),
                                       ),
-                                      for (int i = 0; i < ctrl.ftsResults.length; i++)
-                                        _FtsResultRow(
-                                          index: i,
-                                          total: ctrl.ftsResults.length,
-                                          item: ctrl.ftsResults[i],
-                                          selected: ctrl.selectedFilePath ==
-                                              ctrl.ftsResults[i].legacyPath,
-                                          onTap: () {
-                                            final p = ctrl.ftsResults[i].legacyPath;
-                                            if (p != null && p.isNotEmpty) {
-                                              ctrl.selectFileForPreview(p);
-                                            }
-                                          },
-                                        ),
                                       if (ctrl.ftsResults.isNotEmpty)
-                                        const SizedBox(height: 12),
+                                        SliverPadding(
+                                          padding: const EdgeInsets.fromLTRB(
+                                              10, 0, 10, 12),
+                                          sliver: SliverList.builder(
+                                            itemCount: ctrl.ftsResults.length,
+                                            itemBuilder: (ctx, i) {
+                                              final item = ctrl.ftsResults[i];
+                                              return _FtsResultRow(
+                                                index: i,
+                                                total: ctrl.ftsResults.length,
+                                                item: item,
+                                                selected:
+                                                    ctrl.selectedFilePath ==
+                                                        item.legacyPath,
+                                                onTap: () {
+                                                  final p = item.legacyPath;
+                                                  if (p != null &&
+                                                      p.isNotEmpty) {
+                                                    ctrl.selectFileForPreview(
+                                                        p);
+                                                  }
+                                                },
+                                              );
+                                            },
+                                          ),
+                                        ),
                                     ],
-
-                                    // Directory Files List
                                     if (visibleFiles.isEmpty)
-                                      Padding(
-                                        padding: const EdgeInsets.all(24),
-                                        child: Center(
-                                          child: Text(
-                                            '当前目录暂无匹配笔记',
-                                            style: typo.baseline.bodySmall,
+                                      SliverFillRemaining(
+                                        hasScrollBody: false,
+                                        child: Padding(
+                                          padding: const EdgeInsets.all(24),
+                                          child: Center(
+                                            child: Text(
+                                              '当前目录暂无匹配笔记',
+                                              style: typo.baseline.bodySmall,
+                                            ),
                                           ),
                                         ),
                                       )
                                     else
-                                      for (int i = 0; i < visibleFiles.length; i++)
-                                        _FileListRow(
-                                          index: i,
-                                          total: visibleFiles.length,
-                                          file: visibleFiles[i],
-                                          readingSummary:
-                                              readingMap[visibleFiles[i].path],
-                                          selected: ctrl.selectedFilePath ==
-                                              visibleFiles[i].path,
-                                          onTap: () => ctrl.selectFileForPreview(
-                                              visibleFiles[i].path),
+                                      SliverPadding(
+                                        padding: const EdgeInsets.all(10),
+                                        sliver: SliverList.builder(
+                                          itemCount: visibleFiles.length,
+                                          itemBuilder: (ctx, i) {
+                                            final f = visibleFiles[i];
+                                            return _FileListRow(
+                                              index: i,
+                                              total: visibleFiles.length,
+                                              file: f,
+                                              readingSummary:
+                                                  readingMap[f.path],
+                                              selected:
+                                                  ctrl.selectedFilePath ==
+                                                      f.path,
+                                              onTap: () =>
+                                                  ctrl.selectFileForPreview(
+                                                      f.path),
+                                            );
+                                          },
                                         ),
+                                      ),
                                   ],
                                 ),
                         ),
@@ -543,21 +568,23 @@ class _FilesWorkbenchScreenState extends State<FilesWorkbenchScreen> {
 
                 // 3. Right Workbench: File Preview OR Reading Queue
                 Expanded(
-                  child: Container(
-                    decoration: BoxDecoration(
-                      color: cs.surface,
-                      borderRadius: BorderRadius.circular(M3ERadius.xl),
-                      border: Border.all(
-                          color: cs.outlineVariant.withValues(alpha: 0.45)),
+                  child: RepaintBoundary(
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: cs.surface,
+                        borderRadius: BorderRadius.circular(M3ERadius.xl),
+                        border: Border.all(
+                            color: cs.outlineVariant.withValues(alpha: 0.45)),
+                      ),
+                      clipBehavior: Clip.antiAlias,
+                      child: ctrl.selectedFilePath != null
+                          ? _buildFilePreviewPane(
+                              context,
+                              ctrl.selectedFilePath!,
+                              readingMap[ctrl.selectedFilePath!],
+                            )
+                          : _buildReadingQueuePane(context),
                     ),
-                    clipBehavior: Clip.antiAlias,
-                    child: ctrl.selectedFilePath != null
-                        ? _buildFilePreviewPane(
-                            context,
-                            ctrl.selectedFilePath!,
-                            readingMap[ctrl.selectedFilePath!],
-                          )
-                        : _buildReadingQueuePane(context),
                   ),
                 ),
               ],
@@ -875,21 +902,22 @@ class _FilesWorkbenchScreenState extends State<FilesWorkbenchScreen> {
 
         Divider(color: cs.outlineVariant.withValues(alpha: 0.4)),
 
-        // Full Markdown Preview with Stand-off AI Highlight Layer
+        // Full Markdown Preview with Stand-off AI Highlight Layer (Virtualized)
         Expanded(
           child: ctrl.selectedFileLoading
               ? const Center(child: M3ELoadingIndicator(size: 48))
-              : SingleChildScrollView(
+              : IRMarkdownView(
+                  markdown: ctrl.selectedFileText ?? '',
+                  imageUrlResolver: (src) =>
+                      ctrl.api.resolveImageUrl(src, isAnkiCard: false),
+                  annotations: ctrl.cachedAnnotations(path),
+                  aiLayerEnabled: ctrl.aiLayerEnabled,
+                  anchorLineStart: summary?.frontier?.lineStart,
+                  anchorLineEnd: summary?.frontier?.lineEnd,
+                  anchorScrollToken:
+                      '$path:${summary?.frontier?.lineStart}:${summary?.frontier?.lineEnd}',
+                  scrollable: true,
                   padding: const EdgeInsets.fromLTRB(26, 20, 26, 36),
-                  child: IRMarkdownView(
-                    markdown: ctrl.selectedFileText ?? '',
-                    imageUrlResolver: (src) =>
-                        ctrl.api.resolveImageUrl(src, isAnkiCard: false),
-                    annotations: ctrl.cachedAnnotations(path),
-                    aiLayerEnabled: ctrl.aiLayerEnabled,
-                    anchorLineStart: summary?.frontier?.lineStart,
-                    anchorLineEnd: summary?.frontier?.lineEnd,
-                  ),
                 ),
         ),
       ],

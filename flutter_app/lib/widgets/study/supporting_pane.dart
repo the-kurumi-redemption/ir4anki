@@ -32,24 +32,6 @@ class SupportingPane extends StatefulWidget {
 
 class _SupportingPaneState extends State<SupportingPane> {
   SupportingTab _tab = SupportingTab.fullNote;
-  final GlobalKey _anchorKey = GlobalKey();
-  String _lastScrolledKey = '';
-
-  void _maybeScrollToAnchor(String anchorIdentity) {
-    if (anchorIdentity.isEmpty || anchorIdentity == _lastScrolledKey) return;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      final ctx = _anchorKey.currentContext;
-      if (ctx != null && mounted) {
-        _lastScrolledKey = anchorIdentity;
-        Scrollable.ensureVisible(
-          ctx,
-          alignment: 0.18,
-          duration: const Duration(milliseconds: 360),
-          curve: Curves.easeOutCubic,
-        );
-      }
-    });
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -221,7 +203,7 @@ class _SupportingPaneState extends State<SupportingPane> {
     }
 
     final anns = ctrl.cachedAnnotations(path);
-    _maybeScrollToAnchor('$path:$lineStart:$lineEnd');
+    final anchorToken = '$path:$lineStart:$lineEnd';
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -266,19 +248,18 @@ class _SupportingPaneState extends State<SupportingPane> {
           ),
         ),
         Expanded(
-          child: SingleChildScrollView(
+          child: IRMarkdownView(
+            markdown: fullText,
+            imageUrlResolver: (src) =>
+                ctrl.api.resolveImageUrl(src, isAnkiCard: false),
+            annotations: anns,
+            aiLayerEnabled: ctrl.aiLayerEnabled,
+            anchorLineStart: lineStart,
+            anchorLineEnd: lineEnd,
+            anchorScrollToken: anchorToken,
+            compact: true,
+            scrollable: true,
             padding: const EdgeInsets.fromLTRB(20, 16, 20, 32),
-            child: IRMarkdownView(
-              markdown: fullText,
-              imageUrlResolver: (src) =>
-                  ctrl.api.resolveImageUrl(src, isAnkiCard: false),
-              annotations: anns,
-              aiLayerEnabled: ctrl.aiLayerEnabled,
-              anchorLineStart: lineStart,
-              anchorLineEnd: lineEnd,
-              anchorKey: _anchorKey,
-              compact: true,
-            ),
           ),
         ),
       ],

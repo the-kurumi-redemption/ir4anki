@@ -9,6 +9,7 @@ import 'package:ir4anki_desktop/theme/m3e_motion.dart';
 import 'package:ir4anki_desktop/theme/m3e_theme.dart';
 import 'package:ir4anki_desktop/widgets/m3e/m3e_button.dart';
 import 'package:ir4anki_desktop/widgets/m3e/m3e_indicators.dart';
+import 'package:ir4anki_desktop/widgets/markdown/ir_markdown_view.dart';
 
 void main() {
   group('ClozeEngine', () {
@@ -155,5 +156,40 @@ void main() {
     expect(find.text('3'), findsOneWidget);
     await tester.tap(find.text('Good'));
     expect(tapped, 1);
+  });
+
+  testWidgets('IRMarkdownView scrollable mode virtualizes large documents',
+      (WidgetTester tester) async {
+    final bigDoc = List<String>.generate(
+      300,
+      (i) => '第 ${i + 1} 段正文内容，包含内联公式 \$x_$i + 1\$ 与要点说明。',
+    ).join('\n\n');
+
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildM3ETheme(
+          brightness: Brightness.light,
+          palette: M3EPalettePreset.expressiveViolet,
+          motionScheme: M3EMotionScheme.expressive,
+        ),
+        home: Scaffold(
+          body: SizedBox(
+            width: 800,
+            height: 600,
+            child: IRMarkdownView(
+              markdown: bigDoc,
+              imageUrlResolver: (s) => s,
+              scrollable: true,
+              enableLineHandles: true,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    // Top paragraph is rendered immediately, while the 300th paragraph is
+    // lazily deferred offscreen rather than eagerly built.
+    expect(find.textContaining('第 1 段正文内容'), findsOneWidget);
+    expect(find.textContaining('第 300 段正文内容'), findsNothing);
   });
 }

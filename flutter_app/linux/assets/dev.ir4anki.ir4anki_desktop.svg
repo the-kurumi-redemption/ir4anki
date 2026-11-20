@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <!-- Material 3 Expressive Vibrant Violet -> Botanical Teal gradient -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6B4CE6"/>
+      <stop offset="52%" stop-color="#4A54C4"/>
+      <stop offset="100%" stop-color="#00897B"/>
+    </linearGradient>
+    <linearGradient id="cardGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.98"/>
+      <stop offset="100%" stop-color="#EDE7F6" stop-opacity="0.96"/>
+    </linearGradient>
+    <linearGradient id="hlGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#FFD54F"/>
+      <stop offset="100%" stop-color="#FFB300"/>
+    </linearGradient>
+    <filter id="softShadow" x="-12%" y="-12%" width="124%" height="128%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#1A103D" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+
+  <!-- Expressive Squircle App Plate -->
+  <rect x="28" y="28" width="456" height="456" rx="116" ry="116" fill="url(#bgGrad)"/>
+
+  <!-- Subtle inner organic highlight ring -->
+  <rect x="44" y="44" width="424" height="424" rx="102" ry="102"
+        fill="none" stroke="#FFFFFF" stroke-opacity="0.16" stroke-width="4"/>
+
+  <!-- Layered Flashcard / Reading Stack (back card) -->
+  <rect x="116" y="102" width="280" height="308" rx="36" ry="36"
+        transform="rotate(-5 256 256)" fill="#FFFFFF" fill-opacity="0.22"/>
+
+  <!-- Main Open Incremental Reading Card -->
+  <g filter="url(#softShadow)">
+    <rect x="110" y="106" width="292" height="300" rx="38" ry="38" fill="url(#cardGrad)"/>
+  </g>
+
+  <!-- Reading Header Accent Bar -->
+  <rect x="148" y="150" width="96" height="18" rx="9" fill="#00897B"/>
+  <circle cx="348" cy="159" r="11" fill="#6B4CE6" fill-opacity="0.22"/>
+  <circle cx="348" cy="159" r="5" fill="#6B4CE6"/>
+
+  <!-- Text Lines + Stand-off Amber AI Highlight Ribbon -->
+  <rect x="148" y="196" width="216" height="16" rx="8" fill="#322B4A" fill-opacity="0.22"/>
+  <rect x="144" y="232" width="224" height="34" rx="12" fill="url(#hlGrad)"/>
+  <rect x="158" y="242" width="156" height="14" rx="7" fill="#4A2800" fill-opacity="0.72"/>
+  <rect x="148" y="286" width="194" height="16" rx="8" fill="#322B4A" fill-opacity="0.22"/>
+  <rect x="148" y="320" width="136" height="16" rx="8" fill="#322B4A" fill-opacity="0.16"/>
+
+  <!-- M3E 4-Point Spaced-Repetition Spark Medallion -->
+  <g transform="translate(358, 344)">
+    <circle cx="0" cy="0" r="46" fill="#00897B"/>
+    <circle cx="0" cy="0" r="46" fill="none" stroke="#FFFFFF" stroke-width="6"/>
+    <path d="M 0 -24 C 4 -7 7 -4 24 0 C 7 4 4 7 0 24 C -4 7 -7 4 -24 0 C -7 -4 -4 -7 0 -24 Z"
+          fill="#FFF8E1"/>
+  </g>
+</svg>

@@ -33,6 +33,7 @@ class StudyWorkspace extends StatefulWidget {
 class _StudyWorkspaceState extends State<StudyWorkspace> {
   final GlobalKey<ReadingCardViewState> _readingCardKey = GlobalKey();
   bool _narrowShowSupporting = false;
+  double? _dragSplitRatio;
   late final TextEditingController _quickUrlCtrl;
 
   @override
@@ -371,7 +372,8 @@ class _StudyWorkspaceState extends State<StudyWorkspace> {
         final totalWidth = constraints.maxWidth - 32; // outer horizontal padding
         const dividerWidth = 14.0;
         final usable = (totalWidth - dividerWidth).clamp(400.0, 2400.0);
-        final leftWidth = usable * ctrl.splitRatio;
+        final activeRatio = _dragSplitRatio ?? ctrl.splitRatio;
+        final leftWidth = usable * activeRatio;
         final rightWidth = usable - leftWidth;
 
         return Padding(
@@ -381,17 +383,30 @@ class _StudyWorkspaceState extends State<StudyWorkspace> {
             children: [
               SizedBox(
                 width: leftWidth,
-                child: _buildPrimaryCard(phase),
+                child: RepaintBoundary(child: _buildPrimaryCard(phase)),
               ),
-              // Draggable Split Divider
+              // Draggable Split Divider (local state while dragging = 0 global rebuilds!)
               MouseRegion(
                 cursor: SystemMouseCursors.resizeColumn,
                 child: GestureDetector(
                   behavior: HitTestBehavior.translucent,
                   onHorizontalDragUpdate: (details) {
                     final nextRatio =
-                        (leftWidth + details.delta.dx) / usable;
-                    ctrl.setSplitRatio(nextRatio);
+                        ((leftWidth + details.delta.dx) / usable)
+                            .clamp(0.36, 0.72);
+                    setState(() => _dragSplitRatio = nextRatio);
+                  },
+                  onHorizontalDragEnd: (_) {
+                    final committed = _dragSplitRatio;
+                    _dragSplitRatio = null;
+                    if (committed != null) {
+                      ctrl.setSplitRatio(committed);
+                    }
+                  },
+                  onHorizontalDragCancel: () {
+                    if (_dragSplitRatio != null) {
+                      setState(() => _dragSplitRatio = null);
+                    }
                   },
                   child: SizedBox(
                     width: dividerWidth,
@@ -414,7 +429,9 @@ class _StudyWorkspaceState extends State<StudyWorkspace> {
                 child: Stack(
                   children: [
                     Positioned.fill(
-                      child: SupportingPane(controller: ctrl),
+                      child: RepaintBoundary(
+                        child: SupportingPane(controller: ctrl),
+                      ),
                     ),
                     AnimatedPositioned(
                       duration: motion.defaultSpatial.fallbackDuration,
@@ -424,9 +441,11 @@ class _StudyWorkspaceState extends State<StudyWorkspace> {
                       right: authoring != null ? 0 : -(rightWidth + 32),
                       width: rightWidth,
                       child: authoring != null
-                          ? CardAuthoringDrawer(
-                              controller: ctrl,
-                              request: authoring,
+                          ? RepaintBoundary(
+                              child: CardAuthoringDrawer(
+                                controller: ctrl,
+                                request: authoring,
+                              ),
                             )
                           : const SizedBox.shrink(),
                     ),

@@ -44,6 +44,7 @@ class ReadingCardViewState extends State<ReadingCardView> {
   LineSplitSelection? _pick;
   String _selectedText = '';
   String _selectedBlock = '';
+  final ValueNotifier<bool> _hasSelection = ValueNotifier<bool>(false);
   final ScrollController _scrollController = ScrollController();
 
   @override
@@ -55,6 +56,7 @@ class ReadingCardViewState extends State<ReadingCardView> {
       _pick = null;
       _selectedText = '';
       _selectedBlock = '';
+      _hasSelection.value = false;
       if (_scrollController.hasClients) {
         _scrollController.jumpTo(0);
       }
@@ -63,6 +65,7 @@ class ReadingCardViewState extends State<ReadingCardView> {
 
   @override
   void dispose() {
+    _hasSelection.dispose();
     _scrollController.dispose();
     super.dispose();
   }
@@ -284,13 +287,14 @@ class ReadingCardViewState extends State<ReadingCardView> {
                       tooltip: '添加问答卡 [A]',
                       onPressed: ctrl.busy ? null : ctrl.openAddQaDrawer,
                     ),
-                    M3EIconToggleButton(
-                      icon: Icons.password_rounded,
-                      selected: _selectedText.isNotEmpty,
-                      tooltip: _selectedText.isNotEmpty
-                          ? '用选中文字添加挖空卡 [C]'
-                          : '添加挖空卡 [C]',
-                      onPressed: ctrl.busy ? null : openClozeFromSelection,
+                    ValueListenableBuilder<bool>(
+                      valueListenable: _hasSelection,
+                      builder: (_, hasSel, __) => M3EIconToggleButton(
+                        icon: Icons.password_rounded,
+                        selected: hasSel,
+                        tooltip: hasSel ? '用选中文字添加挖空卡 [C]' : '添加挖空卡 [C]',
+                        onPressed: ctrl.busy ? null : openClozeFromSelection,
+                      ),
                     ),
                     M3EIconToggleButton(
                       icon: Icons.content_cut_rounded,
@@ -373,50 +377,42 @@ class ReadingCardViewState extends State<ReadingCardView> {
 
           Divider(color: cs.outlineVariant.withValues(alpha: 0.4)),
 
-          // Scrollable Markdown + KaTeX + Line-Handle + AI Highlight Body
+          // Virtualized Scrollable Markdown + KaTeX + Line-Handle + AI Highlight Body
           Expanded(
-            child: Scrollbar(
-              controller: _scrollController,
-              child: SingleChildScrollView(
-                controller: _scrollController,
-                padding: const EdgeInsets.fromLTRB(22, 18, 24, 28),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    if (chunk.isPdf)
-                      Container(
-                        padding: const EdgeInsets.all(16),
-                        margin: const EdgeInsets.only(bottom: 12),
-                        decoration: BoxDecoration(
-                          color: cs.tertiaryContainer.withValues(alpha: 0.45),
-                          borderRadius: BorderRadius.circular(M3ERadius.lg),
-                        ),
-                        child: Text(
-                          'PDF 讲义片段（第 ${chunk.pageStart ?? 1}–${chunk.pageEnd ?? 1} 页）：可在此继续查看文字摘录与制卡；完整 PDF 页面框选挖图仍可通过浏览器兜底版使用。',
-                          style: typo.baseline.bodyMedium,
-                        ),
+            child: IRMarkdownView(
+              markdown: chunk.text,
+              imageUrlResolver: (src) =>
+                  ctrl.api.resolveImageUrl(src, isAnkiCard: false),
+              annotations: anns,
+              aiLayerEnabled: ctrl.aiLayerEnabled,
+              enableLineHandles: chunk.canSplit,
+              selectedLines: _pick,
+              onLineBlockTap: _onLineTap,
+              scrollable: true,
+              scrollController: _scrollController,
+              padding: const EdgeInsets.fromLTRB(22, 18, 24, 28),
+              header: chunk.isPdf
+                  ? Container(
+                      padding: const EdgeInsets.all(16),
+                      margin: const EdgeInsets.only(bottom: 12),
+                      decoration: BoxDecoration(
+                        color: cs.tertiaryContainer.withValues(alpha: 0.45),
+                        borderRadius: BorderRadius.circular(M3ERadius.lg),
                       ),
-                    IRMarkdownView(
-                      markdown: chunk.text,
-                      imageUrlResolver: (src) =>
-                          ctrl.api.resolveImageUrl(src, isAnkiCard: false),
-                      annotations: anns,
-                      aiLayerEnabled: ctrl.aiLayerEnabled,
-                      enableLineHandles: chunk.canSplit,
-                      selectedLines: _pick,
-                      onLineBlockTap: _onLineTap,
-                      onSelectionChanged: (sel, blk) {
-                        if (sel != _selectedText) {
-                          setState(() {
-                            _selectedText = sel;
-                            _selectedBlock = blk;
-                          });
-                        }
-                      },
-                    ),
-                  ],
-                ),
-              ),
+                      child: Text(
+                        'PDF 讲义片段（第 ${chunk.pageStart ?? 1}–${chunk.pageEnd ?? 1} 页）：可在此继续查看文字摘录与制卡；完整 PDF 页面框选挖图仍可通过浏览器兜底版使用。',
+                        style: typo.baseline.bodyMedium,
+                      ),
+                    )
+                  : null,
+              onSelectionChanged: (sel, blk) {
+                _selectedText = sel;
+                _selectedBlock = blk;
+                final hasSel = sel.isNotEmpty;
+                if (_hasSelection.value != hasSel) {
+                  _hasSelection.value = hasSel;
+                }
+              },
             ),
           ),
 

@@ -9,14 +9,14 @@ Standalone native desktop client for **IR4Anki** built in Flutter with **Materia
 Make sure the IR4Anki backend is running (default `http://127.0.0.1:8901`, configurable inside **Sync & Settings**):
 
 ```bash
-# Launch standalone native desktop app (auto-builds if needed)
-./flutter_app/run-desktop.sh
+# Install as a first-class native desktop app (launcher menu + icon + ~/.local/bin/ir4anki)
+./flutter_app/run-desktop.sh --install-app
 
-# Force rebuild release bundle and launch
-./flutter_app/run-desktop.sh --build
+# Rebuild release binary and reinstall system desktop app
+./flutter_app/run-desktop.sh --install-app --rebuild
 
-# Install a native Linux desktop menu entry (~/.local/share/applications/ir4anki-desktop.desktop)
-./flutter_app/run-desktop.sh --install-desktop
+# Or launch directly from CLI after install
+ir4anki
 ```
 
 ## Architecture & UX Alignment
