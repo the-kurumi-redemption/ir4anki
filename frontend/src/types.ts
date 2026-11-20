@@ -459,3 +459,127 @@ export interface PdfReadingSource extends PdfReadingChunk {
  breadcrumb:ReadingSourceCrumb[]
 }
 export type ReadingSource=MarkdownReadingSource|PdfReadingSource
+
+// ---- Joplin-mode Storage v2 Types (Stage 4) ----
+
+export interface StorageNotebook {
+  id: string
+  parent_id: string | null
+  title?: string
+  name?: string
+  legacy_path?: string | null
+  pos: number
+  created_at: number | string
+  updated_at: number | string
+  deleted_at: number | string | null
+}
+
+export interface StorageNoteMeta {
+  id: string
+  notebook_id: string | null
+  title: string
+  path?: string
+  body_sha: string
+  in_list: boolean
+  list_pos: number
+  needs_resync: boolean
+  created_at: number | string
+  updated_at: number | string
+  deleted_at?: number | string | null
+  legacy_path?: string | null
+}
+
+export interface StorageSearchResult {
+  id: string
+  notebook_id: string | null
+  title: string
+  body_sha: string
+  in_list: boolean
+  list_pos: number
+  needs_resync: boolean
+  legacy_path: string | null
+  created_at: number | string
+  updated_at: number | string
+  snippet: string
+}
+
+export interface StorageTrashResponse {
+  notebooks: StorageNotebook[]
+  notes: StorageNoteMeta[]
+}
+
+export interface NoteRevisionMeta {
+  id: number
+  note_id: string
+  title: string
+  body_sha: string
+  reason: string
+  created_at: number | string
+  byte_length: number
+}
+
+export interface NoteRevisionDetail extends NoteRevisionMeta {
+  body: string
+}
+
+export interface AiAnnotation {
+  id: string
+  note_id: string
+  layer_name: string
+  quote_exact: string
+  quote_prefix: string
+  quote_suffix: string
+  comment: string
+  line_hint: number
+  status: 'active' | 'orphaned' | string
+  created_at: string
+  updated_at: string
+}
+
+export interface AiAnnotationsResponse {
+  note_id: string | null
+  path: string | null
+  title?: string
+  annotations: AiAnnotation[]
+}
+
+export interface InteropModuleMeta {
+  format: string
+  description: string
+  file_extensions: string[]
+  supports_directory: boolean
+}
+
+export interface InteropImportedNote {
+  note_id: string | null
+  path: string
+  original: string
+  action: 'written' | 'overwritten' | 'renamed' | 'skipped' | string
+  title: string
+  resources_linked: number
+}
+
+export interface InteropImportedResource {
+  resource_id: string
+  original: string
+  filename: string
+  reused: boolean
+}
+
+export interface InteropSkippedItem {
+  path: string
+  reason: string
+}
+
+export interface InteropImportSummary {
+  notes_imported: number
+  notes_written: number
+  notes_overwritten: number
+  notes_renamed: number
+  notes_skipped: number
+  resources_imported: number
+  resources_new: number
+  resources_reused: number
+  skipped: number
+  warnings: number
+}

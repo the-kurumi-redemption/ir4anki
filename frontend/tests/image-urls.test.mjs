@@ -21,8 +21,12 @@ if (process.argv.includes('--render')) {
  ['https://example.org/a%20b.png?size=2#part', 'https://example.org/a%20b.png?size=2#part'],
  ['//example.org/a.png', '//example.org/a.png'],
  ['data:image/png;base64,aGVsbG8=', 'data:image/png;base64,aGVsbG8='],
+ [':/0123456789abcdef0123456789abcdef', '/api/resources/0123456789abcdef0123456789abcdef'],
+ [':/0123456789abcdef0123456789abcdef#anchor', '/api/resources/0123456789abcdef0123456789abcdef#anchor'],
+ [':/0123456789abcdef0123456789abcdef?v=1#sec', '/api/resources/0123456789abcdef0123456789abcdef?v=1#sec'],
  ]
  for (const [src, expected] of cases) assert.deepEqual(imageSources(`![image](<${src}>)`), [expected], src)
+ assert.deepEqual(imageSources('![](:/0123456789abcdef0123456789abcdef.png)'), ['/api/resources/0123456789abcdef0123456789abcdef.png'])
  assert(!renderMarkdown('![](javascript:alert(1))').includes('<img'))
  console.log('PASS actual renderMarkdown path encoding once, suffixes, Unicode/percent/malformed paths, separator safety, ordinary/external/data URLs')
 }

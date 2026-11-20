@@ -3,6 +3,8 @@ import type {
   AnswerResponse,
   MoreResponse,
   NoteResponse,
+  NoteRevisionDetail,
+  NoteRevisionMeta,
   NoteUpdateResponse,
   ReadingActResponse,
   ReadingCorpusFile,
@@ -15,6 +17,10 @@ import type {
   ReadingStatusResponse,
   SessionStateResponse,
   StartResponse,
+  StorageNotebook,
+  StorageNoteMeta,
+  StorageSearchResult,
+  StorageTrashResponse,
   UndoResponse,
 } from './types'
 
@@ -74,8 +80,13 @@ export class UploadPartialError extends ApiError {
 
 export interface FilesUploadResponse {
   ok: boolean
-  saved: { path: string; action: string; original?: string }[]
+  saved: { path: string; action: string; original?: string; note_id?: string; resource_id?: string }[]
   images_renamed: Record<string, string>
+  imported_notes?: import('./types').InteropImportedNote[]
+  imported_resources?: import('./types').InteropImportedResource[]
+  skipped?: import('./types').InteropSkippedItem[]
+  warnings?: string[]
+  summary?: import('./types').InteropImportSummary
 }
 
 function get<T>(url: string, signal?: AbortSignal): Promise<T> {
@@ -266,13 +277,13 @@ export const api = {
     post<ReadingEditResponse>('/api/reading/edit', {
       path, seg_id: segId, new_text: newText, expected_revision: revision, expected_fingerprint: fingerprint,
     }),
-  /** Reading-mode note image upload (P5): stores in NOTES_DIR/_assets,
-   *  returns the bare filename to embed as `![](filename)`. */
-  readingMediaUpload: (file: File): Promise<{ filename: string }> => {
+  /** Reading-mode note image upload (P5 + Stage 3): stores in media/ sandbox
+   *  and returns `filename`, `resource_id`, and `markdown` (`![](:/<resource_id>)`). */
+  readingMediaUpload: (file: File): Promise<{ filename: string; resource_id?: string; markdown?: string }> => {
     const fd = new FormData()
     fd.append('file', file)
     return fetch('/api/reading/media/upload', { method: 'POST', body: fd }).then(r =>
-      parse<{ filename: string }>(r),
+      parse<{ filename: string; resource_id?: string; markdown?: string }>(r),
     )
   },
   readingListAdd: (path: string, fresh = false) =>
@@ -282,6 +293,72 @@ export const api = {
     post<{ ok: boolean; order: string[] }>('/api/reading/list/remove', { path }),
   readingListReorder: (arg: { path: string; top?: boolean } | { order: string[] }) =>
     post<{ ok: boolean; order: string[] }>('/api/reading/list/reorder', arg),
+
+  // ---- Joplin-mode Storage v2 API (Stage 4: UUID tree, FTS5 search, trash, revisions, resources) ----
+  storageTree: () =>
+    get<{ notebooks: StorageNotebook[]; notes: StorageNoteMeta[] }>('/api/storage/tree'),
+  storageSearch: (q: string, notebookId?: string | null, limit = 50) => {
+    const params = new URLSearchParams({ q, limit: String(limit) })
+    if (notebookId) params.set('notebook_id', notebookId)
+    return get<{ query: string; results: StorageSearchResult[] }>(`/api/storage/search?${params.toString()}`)
+  },
+  storageTrash: () => get<StorageTrashResponse>('/api/storage/trash'),
+  storageTrashRestore: (kind: 'note' | 'notebook', id: string) =>
+    post<{ ok: boolean; kind: 'note' | 'notebook'; restored: unknown }>('/api/storage/trash/restore', { kind, id }),
+  storageTrashEmpty: () =>
+    post<{ ok: boolean; notes_purged: number; notebooks_purged: number }>('/api/storage/trash/empty'),
+  noteGet: (noteIdOrPath: string) =>
+    get<StorageNoteMeta & { body: string }>(`/api/notes/${encodeURIComponent(noteIdOrPath)}`),
+  noteRevisions: (noteIdOrPath: string) =>
+    get<{ note_id: string; path: string; revisions: NoteRevisionMeta[] }>(
+      `/api/notes/${encodeURIComponent(noteIdOrPath)}/revisions`,
+    ),
+  noteRevisionDetail: (noteIdOrPath: string, revisionId: number) =>
+    get<NoteRevisionDetail>(
+      `/api/notes/${encodeURIComponent(noteIdOrPath)}/revisions/${revisionId}`,
+    ),
+  noteRevisionRestore: (noteIdOrPath: string, revisionId: number) =>
+    post<{ ok: boolean; note: StorageNoteMeta & { body: string } }>(
+      `/api/notes/${encodeURIComponent(noteIdOrPath)}/revisions/${revisionId}/restore`,
+    ),
+  resourceUpload: (file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return fetch('/api/resources/upload', { method: 'POST', body: fd }).then(r =>
+      parse<{ ok: boolean; resource: { id: string; filename: string }; markdown: string }>(r),
+    )
+  },
+  noteAnnotations: (path: string, signal?: AbortSignal) =>
+    get<import('./types').AiAnnotationsResponse>(
+      `/api/annotations?path=${encodeURIComponent(path)}`,
+      signal,
+    ),
+  interopModules: () =>
+    get<{ modules: import('./types').InteropModuleMeta[] }>('/api/interop/modules'),
+  interopImport: (
+    entries: { file: File; rel: string }[],
+    dir: string,
+    onConflict: 'error' | 'overwrite' | 'rename' | 'skip' = 'error',
+    format = 'md',
+  ): Promise<FilesUploadResponse> => {
+    const fd = new FormData()
+    for (const e of entries) {
+      fd.append('files', e.file)
+      fd.append('rel_paths', e.rel)
+    }
+    fd.append('dir', dir)
+    fd.append('on_conflict', onConflict)
+    fd.append('format', format)
+    return fetch('/api/interop/import', { method: 'POST', body: fd }).then(async r => {
+      if (r.status === 409) {
+        const detail = String((await r.json() as { detail?: string }).detail ?? '')
+        const conflict = new UploadConflictError(detail)
+        if (conflict.conflicts.length) throw conflict
+        throw new ApiError(detail || '上传目标冲突', 409)
+      }
+      return parse<FilesUploadResponse>(r)
+    })
+  },
 }
 
 /** Accept only same-origin engine download routes; never navigate to a

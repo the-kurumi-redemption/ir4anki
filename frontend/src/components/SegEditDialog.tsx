@@ -117,8 +117,8 @@ export const SegEditDialog: Component<Props> = (props) => {
     if (!file || !cm) return
     setBusy(true)
     try {
-      const { filename } = await api.readingMediaUpload(file)
-      cm.insertAtCursor(`\n![](${filename})\n`)
+      const res = await api.readingMediaUpload(file)
+      cm.insertAtCursor(`\n${res.markdown || `![](${res.filename})`}\n`)
       schedulePreview()
     } catch (err) {
       setError('图片上传失败：' + (err as Error).message)
@@ -192,7 +192,7 @@ export const SegEditDialog: Component<Props> = (props) => {
           </md-icon-button>
           <input type="file" ref={imgFileRef} accept="image/*" style="display:none" onChange={onImgPicked} />
           <span class="seg-edit-hint md-typescale-label-small">
-            Ctrl+Enter 保存 · 图片存入 _assets · 引用用文件名
+            Ctrl+Enter 保存 · 图片自动存入媒体沙箱 · 保存自动生成历史版本
           </span>
         </div>
 

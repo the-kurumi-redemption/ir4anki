@@ -88,7 +88,13 @@ md.renderer.rules.image = (tokens, idx, options, env, self) => {
   const srcIdx = token.attrIndex('src')
   if (srcIdx >= 0) {
     const src = String(token.attrs![srcIdx][1] ?? '')
-    if (!/^(?:[a-z][a-z0-9+.-]*:|\/)/i.test(src)) {
+    if (src.startsWith(':/')) {
+      const [, resPath, query = '', fragment = ''] = src.slice(2).match(/^([^?#]*)(\?[^#]*)?(#.*)?$/)!
+      const base = resPath.split('/').pop() || ''
+      if (base && base !== '.' && base !== '..' && !/[\/\\]/.test(base)) {
+        token.attrs![srcIdx][1] = '/api/resources/' + encodeURIComponent(base) + query + fragment
+      }
+    } else if (!/^(?:[a-z][a-z0-9+.-]*:|\/)/i.test(src)) {
       // Split URL syntax before decoding so encoded ?/# remain filename bytes.
       const [, path, query = '', fragment = ''] = src.match(/^([^?#]*)(\?[^#]*)?(#.*)?$/)!
       const encodedBase = path.split('/').pop() || ''

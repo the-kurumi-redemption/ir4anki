@@ -4,14 +4,21 @@ import { Component, Show, createEffect, createMemo, createSignal, on, onCleanup,
 import { renderMarkdown } from '../lib/markdown'
 import { trackChunkSelection } from '../lib/chunk-selection'
 import {
+  aiLayerEnabled,
+  applyAiLayer,
+  fetchNoteAnnotations,
+  observeAiAnnotations,
+  toggleAiLayer,
+} from '../lib/ai-layer'
+import {
   annotateLines,
   annotatedItems,
   previewHeadTail,
   resolveLineAt,
   type SplitSelection,
 } from '../lib/split-selection'
-import type { ReadingChunk } from '../types'
-import { IconAdd, IconArrowBack, IconClose, IconContentCut, IconEdit, IconPassword, IconUndo } from './icons'
+import type { AiAnnotation, ReadingChunk } from '../types'
+import { IconAdd, IconArrowBack, IconClose, IconContentCut, IconEdit, IconInkHighlighter, IconPassword, IconUndo } from './icons'
 
 // Reading card (渐进制卡, user spec 2026-09-19; action redesign round 2;
 // 三栏重构 2026-09-21). One note chunk to read and turn into cards BY HAND.
@@ -193,6 +200,7 @@ export const ReadingCard: Component<Props> = (props) => {
     const t = e.target as HTMLElement | null
     if (!t?.closest) return
     if (t.closest('a')) return // let links navigate, never pick
+    if (t.dataset?.aiLayer === 'true' || t.parentElement?.closest?.('[data-ai-layer]')) return
     const isHandle = !!t.closest('.line-handle')
     let item = t.closest('.line-handle, .line, .line-anchor') as
       | HTMLElement
@@ -241,6 +249,30 @@ export const ReadingCard: Component<Props> = (props) => {
     }
   }
 
+  // ---- Stand-off AI Highlight & Comment Layer ----
+  const [aiAnns, setAiAnns] = createSignal<AiAnnotation[]>([])
+  let annReqToken = 0
+
+  const refreshAiAnns = (path: string) => {
+    const token = ++annReqToken
+    if (!path || typeof window === 'undefined' || typeof globalThis.fetch !== 'function') {
+      setAiAnns([])
+      return
+    }
+    fetchNoteAnnotations(path).then(list => {
+      if (!disposed && token === annReqToken) {
+        setAiAnns(list)
+      }
+    })
+  }
+
+  const unsubAi = observeAiAnnotations(invPath => {
+    if (!invPath || invPath === props.chunk.path) {
+      refreshAiAnns(props.chunk.path)
+    }
+  })
+  onCleanup(() => unsubAi())
+
   // ---- hover indicator (user spec 2026-10-05) ----
   // CSS :hover alone flickers in the line-height gaps of a wrapped source
   // line (gap belongs to no box → hover drops). mousemove + resolveLineAt
@@ -256,6 +288,12 @@ export const ReadingCard: Component<Props> = (props) => {
   }
   const onBodyMove = (e: MouseEvent) => {
     if (!bodyRef) return
+    const t = e.target as HTMLElement | null
+    const aiLayerHit = t?.closest?.('[data-ai-layer]') as HTMLElement | null
+    if (aiLayerHit?.dataset?.aiLayer === 'true') {
+      clearHover()
+      return
+    }
     const hit = resolveLineAt(bodyRef, e.clientX, e.clientY)
     const el = hit?.el ?? null
     if (el === hoverEl) return
@@ -279,12 +317,25 @@ export const ReadingCard: Component<Props> = (props) => {
         clearPick()
         clearHover()
         const text = props.chunk.text
+        refreshAiAnns(props.chunk.path)
         queueMicrotask(() => {
           if (!bodyRef) return
           annotateLines(bodyRef, text)
           applySelClasses()
+          applyAiLayer(bodyRef, aiAnns(), aiLayerEnabled())
         })
       },
+    ),
+  )
+  createEffect(
+    on(
+      () => [aiAnns(), aiLayerEnabled()] as const,
+      ([list, enabled]) => {
+        if (!bodyRef) return
+        annotateLines(bodyRef, props.chunk.text)
+        applyAiLayer(bodyRef, list, enabled)
+      },
+      { defer: true },
     ),
   )
   createEffect(() => {
@@ -362,6 +413,17 @@ export const ReadingCard: Component<Props> = (props) => {
                   <md-icon><IconEdit /></md-icon>
                 </md-icon-button>
               </Show>
+              <md-icon-button
+                data-ai-layer-toggle
+                class={aiLayerEnabled() ? 'ai-layer-toggle ai-layer-toggle--on' : 'ai-layer-toggle'}
+                aria-label={aiLayerEnabled() ? '隐藏 AI 重点图层' : '显示 AI 重点图层'}
+                aria-pressed={aiLayerEnabled()}
+                title={aiLayerEnabled() ? 'AI 重点图层：已开启（点击隐藏高亮与批注）' : 'AI 重点图层：已关闭（点击显示高亮与批注）'}
+                onKeyDown={roundControlKeyDown}
+                onClick={() => toggleAiLayer()}
+              >
+                <md-icon><IconInkHighlighter /></md-icon>
+              </md-icon-button>
               <Show when={trace()}>
                 <md-icon-button
                   aria-label="回到复习" title="回到复习"

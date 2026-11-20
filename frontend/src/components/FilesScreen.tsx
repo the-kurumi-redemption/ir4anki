@@ -6,7 +6,7 @@ import {remapPath} from '../lib/files-state'
 import {fileIntentId,basename,parentPath,normalizeTargets,visibleEntries,moveError,SerialBatch,editingEvent,type Entry,type BatchReport} from '../lib/files-browser'
 import {requestDraftLeave} from '../lib/draft-leave'
 import {partitionImports,type SkippedImport} from '../lib/file-import'
-import type {ReadingFileSummary,ReadingCorpusFile} from '../types'
+import type {ReadingFileSummary,ReadingCorpusFile,StorageSearchResult,StorageTrashResponse,NoteRevisionMeta,NoteRevisionDetail} from '../types'
 import {FileViewer,invalidateFileCache} from './FileViewer'
 import {FilesLecturePreview} from './FilesLecturePreview'
 import {FilesMenu} from './FilesMenu'
@@ -25,6 +25,7 @@ export const FilesScreen:Component<Props>=(props)=>{
  const [previewPath,setPreviewPath]=createSignal<string|null>(null),[drawer,setDrawer]=createSignal(false),[loading,setLoading]=createSignal(true),[loadError,setLoadError]=createSignal(''),[message,setMessage]=createSignal('')
  const [importConflict,setImportConflict]=createSignal<ImportConflict|null>(null)
  const [skippedImports,setSkippedImports]=createSignal<SkippedImport[]>([])
+ const [importWarnings,setImportWarnings]=createSignal<string[]>([])
  const [working,setWorking]=createSignal(false),[version,setVersion]=createSignal(0),[operationVersion,setOperationVersion]=createSignal(0)
  const [undoId,setUndoId]=createSignal<string|null>(read('files-undo-operation',null)),[dialog,setDialog]=createSignal<DialogState|null>(null),[value,setValue]=createSignal(''),[dialogError,setDialogError]=createSignal('')
  const [readingList,setReadingList]=createSignal<ReadingFileSummary[]>([])
@@ -34,6 +35,15 @@ export const FilesScreen:Component<Props>=(props)=>{
  const [readingError,setReadingError]=createSignal('')
  const [readingMessage,setReadingMessage]=createSignal('')
  const [removeTarget,setRemoveTarget]=createSignal<ReadingFileSummary|null>(null)
+ const [ftsHits,setFtsHits]=createSignal<StorageSearchResult[]>([])
+ const [ftsLoading,setFtsLoading]=createSignal(false)
+ const [trashOpen,setTrashOpen]=createSignal(false)
+ const [trashData,setTrashData]=createSignal<StorageTrashResponse>({notebooks:[],notes:[]})
+ const [trashBusy,setTrashBusy]=createSignal(false)
+ const [revOpen,setRevOpen]=createSignal(false)
+ const [revList,setRevList]=createSignal<NoteRevisionMeta[]>([])
+ const [revDetail,setRevDetail]=createSignal<NoteRevisionDetail|null>(null)
+ const [revBusy,setRevBusy]=createSignal(false)
  const savedReport=read<BatchReport|null>(batchKey,null)
  const restored=savedReport&&Array.isArray(savedReport.items)?savedReport:null
  if(restored)restored.items=restored.items.map(i=>({...i,status:i.status==='running'?'unconfirmed':i.status}))
@@ -41,7 +51,7 @@ export const FilesScreen:Component<Props>=(props)=>{
  const [drag,setDrag]=createSignal<Entry[]>([]),[drop,setDrop]=createSignal<string|null>(null),[externalDrop,setExternalDrop]=createSignal(false)
  const [history,setHistory]=createSignal<string[]>([])
  const owner={}
- let alive=true,generation=0,anchor='',list!:HTMLDivElement,input!:HTMLInputElement,folderInput!:HTMLInputElement,uploadDirectory='',suppressClick=false,returnFocus:HTMLElement|null=null
+ let alive=true,generation=0,ftsTimer=0,ftsSeq=0,anchor='',list!:HTMLDivElement,input!:HTMLInputElement,folderInput!:HTMLInputElement,uploadDirectory='',suppressClick=false,returnFocus:HTMLElement|null=null
  const all=createMemo<Entry[]>(()=>[...dirs().map(path=>({path,isDir:true})),...files().map(f=>({path:f.path,isDir:false,revision:f.revision}))])
  const summaryMap=createMemo(()=>{const m=new Map<string,ReadingFileSummary>();for(const s of readingList())m.set(s.path,s);return m})
  const corpusMap=createMemo(()=>{const m=new Map<string,ReadingCorpusFile>();for(const c of corpus())m.set(c.path,c);return m})
@@ -263,6 +273,7 @@ export const FilesScreen:Component<Props>=(props)=>{
   if(!entries.length||busy()||!requestDraftLeave())return
   const {supported,skipped}=partitionImports(entries,true)
   setSkippedImports(skipped)
+  if(typeof setImportWarnings==='function')setImportWarnings([])
   setMessage(supported.length?'':'没有可导入的文件，请展开跳过清单查看原因')
   if(supported.length)await importEntries(supported,uploadDirectory,'error')
  }
@@ -279,7 +290,31 @@ export const FilesScreen:Component<Props>=(props)=>{
     if(genericHalted)return items.map(t=>({path:t.path,status:'not-started' as const}))
     const coupled=generic.some(e=>target(e).path===items[0].path)
     try{
-     if(coupled){const result=await api.filesUpload(generic,dir,policy);if(Object.keys(result.images_renamed??{}).length&&alive)setMessage('图片重名已自动改名并更新引用：'+Object.entries(result.images_renamed).map(([a,b])=>a+' → '+b).join('；'))}
+     if(coupled){
+      const result=await api.filesUpload(generic,dir,policy)
+      if(alive){
+       const serverSkipped=(result.skipped??[]).map(s=>({rel:s.path,reason:s.reason}))
+       if(serverSkipped.length&&typeof setSkippedImports==='function'){
+        setSkippedImports(prev=>{
+         const seen=new Set(prev.map(x=>x.rel))
+         return [...prev,...serverSkipped.filter(x=>!seen.has(x.rel))]
+        })
+       }
+       const warnings=result.warnings??[]
+       if(typeof setImportWarnings==='function')setImportWarnings(warnings)
+       if(result.summary){
+        const s=result.summary
+        const parts:string[]=[`已导入 ${s.notes_imported} 篇笔记`]
+        if(s.resources_imported>0)parts.push(`${s.resources_imported} 张图片`+(s.resources_reused>0?`（其中 ${s.resources_reused} 张去重复用）`:''))
+        if(s.skipped>0)parts.push(`跳过 ${s.skipped} 项`)
+        if(s.warnings>0)parts.push(`${s.warnings} 条告警`)
+        setMessage(parts.join(' · '))
+       }else if(Object.keys(result.images_renamed??{}).length){
+        setMessage('图片重名已自动改名并更新引用：'+Object.entries(result.images_renamed).map(([a,b])=>a+' → '+b).join('；'))
+       }
+       for(const n of result.imported_notes??[]){if(n.path)invalidateFileCache(n.path)}
+      }
+     }
      else {const entry=entries.find(e=>target(e).path===items[0].path)!;const body=new FormData();body.append('file',entry.file);body.append('path',items[0].path);await lectureRequest('/import','POST',body)}
      if(alive){for(const t of items)invalidateFileCache(t.path);window.dispatchEvent(new Event('lecture-documents-changed'));setVersion(v=>v+1)}
      return items.map(t=>({path:t.path,status:'confirmed' as const}))
@@ -301,12 +336,117 @@ export const FilesScreen:Component<Props>=(props)=>{
   try{await operations.run('undo','',id);if(alive)setMessage('已撤销上次单项文件迁移')}
   catch(e){if(alive)setMessage((e as Error).message)}finally{if(alive){setWorking(false);await reload()}}
  }
+ function scheduleFts(raw:string){
+  clearTimeout(ftsTimer)
+  const q=raw.trim()
+  if(q.length<2){++ftsSeq;setFtsHits([]);setFtsLoading(false);return}
+  const token=++ftsSeq;setFtsLoading(true)
+  ftsTimer=window.setTimeout(async()=>{
+   try{
+    const res=await api.storageSearch(q)
+    if(alive&&token===ftsSeq)setFtsHits(res.results??[])
+   }catch{
+    if(alive&&token===ftsSeq)setFtsHits([])
+   }finally{
+    if(alive&&token===ftsSeq)setFtsLoading(false)
+   }
+  },220)
+ }
+ const fmtTs=(ms?:number|string|null)=>ms?new Date(typeof ms==='number'?ms:Number(ms)||ms).toLocaleString('zh-CN',{hour12:false}):''
+ async function openTrash(){
+  if(busy())return
+  returnFocus=document.activeElement as HTMLElement
+  setTrashOpen(true);setTrashBusy(true)
+  try{
+   const res=await api.storageTrash()
+   if(alive)setTrashData(res)
+  }catch(e){
+   if(alive)setMessage('读取回收站失败：'+(e as Error).message)
+  }finally{
+   if(alive)setTrashBusy(false)
+  }
+ }
+ async function restoreTrashItem(kind:'notebook'|'note',id:string){
+  if(trashBusy())return
+  setTrashBusy(true)
+  try{
+   await api.storageTrashRestore(kind,id)
+   const res=await api.storageTrash()
+   if(alive){setTrashData(res);setMessage('已从回收站恢复');await reload()}
+  }catch(e){
+   if(alive)setMessage('恢复失败：'+(e as Error).message)
+  }finally{
+   if(alive)setTrashBusy(false)
+  }
+ }
+ async function emptyTrash(){
+  if(trashBusy())return
+  setTrashBusy(true)
+  try{
+   await api.storageTrashEmpty()
+   if(alive){setTrashData({notebooks:[],notes:[]});setMessage('回收站已清空')}
+  }catch(e){
+   if(alive)setMessage('清空回收站失败：'+(e as Error).message)
+  }finally{
+   if(alive)setTrashBusy(false)
+  }
+ }
+ async function openRevisions(path:string){
+  if(busy())return
+  returnFocus=document.activeElement as HTMLElement
+  setRevOpen(true);setRevBusy(true);setRevList([]);setRevDetail(null)
+  try{
+   const res=await api.noteRevisions(path)
+   if(!alive)return
+   const items=res.revisions??[]
+   setRevList(items)
+   if(items.length>0){
+    const detail=await api.noteRevisionDetail(path,items[0].id)
+    if(alive)setRevDetail(detail)
+   }
+  }catch(e){
+   if(alive)setMessage('读取历史版本失败：'+(e as Error).message)
+  }finally{
+   if(alive)setRevBusy(false)
+  }
+ }
+ async function selectRevision(path:string,revId:number){
+  if(revBusy())return
+  setRevBusy(true)
+  try{
+   const detail=await api.noteRevisionDetail(path,revId)
+   if(alive)setRevDetail(detail)
+  }catch(e){
+   if(alive)setMessage('读取版本内容失败：'+(e as Error).message)
+  }finally{
+   if(alive)setRevBusy(false)
+  }
+ }
+ async function rollbackRevision(path:string,revId:number){
+  if(revBusy()||!requestDraftLeave())return
+  setRevBusy(true)
+  try{
+   await api.noteRevisionRestore(path,revId)
+   if(!alive)return
+   invalidateFileCache(path)
+   setVersion(v=>v+1)
+   setRevOpen(false)
+   setMessage(`已回滚至版本 #${revId}`)
+   await reload()
+   restoreFocus()
+  }catch(e){
+   if(alive)setMessage('回滚失败：'+(e as Error).message)
+  }finally{
+   if(alive)setRevBusy(false)
+  }
+ }
  const dialogRef=(el:HTMLDialogElement)=>{queueMicrotask(()=>{if(el.isConnected&&!el.open)el.showModal()})}
  return <section class="fb-workspace" aria-label="文件工作区" onKeyDown={key} onPointerDown={()=>{suppressClick=false}} onDragOver={e=>{if(e.dataTransfer?.types.includes('Files')){e.preventDefault();setExternalDrop(true)}}} onDrop={e=>{if(e.dataTransfer?.types.includes('Files')){e.preventDefault();setExternalDrop(false);setMessage('外部文件请使用导入按钮')}}}>
   <input ref={input} hidden type="file" multiple accept=".md,.pdf,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp,.svg,.bmp,.avif" onChange={e=>void importFiles(e.currentTarget)}/>
   <input ref={el=>{folderInput=el;el.setAttribute('webkitdirectory','')}} hidden type="file" multiple onChange={e=>void importFiles(e.currentTarget)}/>
-  <header class="fb-header"><div><h1>文件</h1><p>管理阅读文件</p></div><div class="fb-import-actions"><md-filled-button disabled={busy()} onClick={()=>pickImport()}>导入文件</md-filled-button><md-outlined-button disabled={busy()} onClick={()=>pickImport(true)}>导入文件夹</md-outlined-button><md-outlined-button disabled={busy()} onClick={()=>open('mkdir',[])}>新建文件夹</md-outlined-button><Show when={undoId()}><FilesMenu label="更多文件操作" disabled={busy()} actions={[{label:'撤销上次单项迁移',run:()=>void undo()}]}/></Show></div></header>
-  <Show when={skippedImports().length}><details class="fb-report fb-import-skipped"><summary>已跳过 {skippedImports().length} 个文件（未上传）</summary><div class="fb-report-items"><For each={skippedImports()}>{item=><div><strong>{item.rel}</strong><span>{item.reason}</span></div>}</For></div></details></Show>
+  <header class="fb-header"><div><h1>文件</h1><p>管理阅读文件</p></div><div class="fb-import-actions"><md-filled-button disabled={busy()} onClick={()=>pickImport()}>导入文件</md-filled-button><md-outlined-button disabled={busy()} onClick={()=>pickImport(true)}>导入文件夹</md-outlined-button><md-outlined-button disabled={busy()} onClick={()=>open('mkdir',[])}>新建文件夹</md-outlined-button><md-outlined-button disabled={busy()} onClick={()=>void openTrash()}>回收站</md-outlined-button><Show when={undoId()}><FilesMenu label="更多文件操作" disabled={busy()} actions={[{label:'撤销上次单项迁移',run:()=>void undo()}]}/></Show></div></header>
+  <Show when={skippedImports().length}><details class="fb-report fb-import-skipped"><summary>已跳过 {skippedImports().length} 个文件（未入库）</summary><div class="fb-report-items"><For each={skippedImports()}>{item=><div><strong>{item.rel}</strong><span>{item.reason}</span></div>}</For></div></details></Show>
+  <Show when={importWarnings().length}><details class="fb-report fb-import-warnings"><summary>导入告警（{importWarnings().length} 条）</summary><div class="fb-report-items"><For each={importWarnings()}>{w=><div><span>{w}</span></div>}</For></div></details></Show>
   <div class="fb-layout">
    <Show when={drawer()}><button class="fb-drawer-scrim" aria-label="关闭目录导航" onClick={()=>setDrawer(false)}/></Show>
    <aside class="fb-sidebar" classList={{'fb-sidebar--open':drawer()}} aria-label="文件夹导航" onKeyDown={e=>{
@@ -320,7 +460,7 @@ export const FilesScreen:Component<Props>=(props)=>{
    </aside>
    <main class="fb-main">
     <nav class="fb-navigation" aria-label="当前文件夹路径"><button class="fb-directory-toggle" onClick={()=>{setDrawer(true);requestAnimationFrame(()=>document.querySelector<HTMLElement>('.fb-sidebar button')?.focus())}}>目录</button><md-icon-button aria-label="后退" disabled={!history().length} onClick={goBack}><md-icon><IconArrowBack/></md-icon></md-icon-button><md-icon-button aria-label="上一级" disabled={!currentDir()} onClick={()=>navigate(parentPath(currentDir()))}><md-icon><span style={{display:'flex',transform:'rotate(90deg)'}}><IconArrowBack/></span></md-icon></md-icon-button><div class="fb-breadcrumb"><button onClick={()=>navigate('')}>全部文件</button><For each={currentDir().split('/').filter(Boolean)}>{(part,index)=><><IconChevronRight size={16}/><button title={currentDir().split('/').slice(0,index()+1).join('/')} onClick={()=>navigate(currentDir().split('/').slice(0,index()+1).join('/'))}>{part}</button></>}</For></div><md-icon-button aria-label="刷新文件列表" onClick={()=>void reload()} disabled={loading()||working()}><md-icon><IconRestartAlt/></md-icon></md-icon-button></nav>
-    <div class="fb-search"><input type="search" aria-label="在全部文件中搜索" placeholder="在全部文件中搜索" value={query()} onInput={e=>setQuery(e.currentTarget.value)}/></div>
+    <div class="fb-search"><input type="search" aria-label="在全部文件中搜索" placeholder="在全部文件中搜索" value={query()} onInput={e=>{const q=e.currentTarget.value;setQuery(q);scheduleFts(q)}}/></div>
     <Show when={message()||drag().length||externalDrop()}><div role="status" aria-live="polite"><Show when={drag().length}>{drop()===null?'拖到文件夹或根目录；Escape 取消':moveError(drag(),drop()!,all())||`移动到 ${drop()||'根目录'}`}</Show><Show when={externalDrop()}>外部文件请使用导入按钮</Show><span>{message()}</span></div></Show>
   <Show when={report()?.items.some(i=>i.status!=='confirmed')}><details class="fb-operation-feedback fb-recovery" open role="alert"><summary>{report()!.action}结果 · {report()!.items.filter(i=>i.status==='confirmed').length}/{report()!.items.length} 已确认{unresolved()?' · 有待确认项目，已停止后续操作':''}</summary><div class="fb-report-items"><For each={report()!.items}>{item=><div><strong>{item.path}</strong><span>{({'confirmed':'已确认','failed':'失败','unconfirmed':'结果待确认','not-started':'未开始','running':'处理中'})[item.status]}</span><span>{item.message}</span><Show when={item.status==='unconfirmed'}><small>当前列表：{all().some(t=>t.path===item.path)?'原路径仍可见':'原路径未列出'}。请核对原路径与目标；这不代表原请求已确认。</small></Show></div>}</For></div><Show when={!working()}><md-text-button disabled={(operationVersion(),operations.isBusy())} onClick={()=>{setReport(null);sessionStorage.removeItem(batchKey)}}>{unresolved()?'已核对，结束本批；不重试剩余项目':'关闭结果'}</md-text-button></Show></details></Show>
     <div class="fb-command-slot" aria-label="文件操作">
@@ -331,7 +471,7 @@ export const FilesScreen:Component<Props>=(props)=>{
     <div class="fb-list" ref={list} tabIndex={0} role="listbox" aria-label="当前文件夹内容" aria-multiselectable="true" aria-busy={loading()||working()} onDragOver={e=>over(e,currentDir())} onDrop={e=>dropped(e,currentDir())} onDragLeave={e=>{if(!e.currentTarget.contains(e.relatedTarget as Node)){setDrop(null);setExternalDrop(false)}}}>
      <Show when={loading()}><p role="status" class="fb-empty">正在读取文件列表…</p></Show>
      <Show when={loadError()}><div class="fb-empty" role="alert">{loadError()}<md-text-button onClick={()=>void reload()}>重试</md-text-button></div></Show>
-     <Show when={!loading()&&!loadError()&&!rows().length}><div class="fb-empty"><IconFolderOpen size={40}/><h2>{query()?'没有匹配项目':'这个文件夹还是空的'}</h2><p>{query()?'试试其他文件名或文件夹名。':'可导入 Markdown、PDF / PPT / PPTX 和图片，也可先创建文件夹。'}</p><Show when={!query()}><md-filled-tonal-button disabled={busy()} onClick={()=>pickImport()}>导入到当前文件夹</md-filled-tonal-button><md-text-button disabled={busy()} onClick={()=>open('mkdir',[])}>新建文件夹</md-text-button></Show></div></Show>
+     <Show when={!loading()&&!loadError()&&!rows().length&&!ftsHits().length&&!ftsLoading()}><div class="fb-empty"><IconFolderOpen size={40}/><h2>{query()?'没有匹配项目':'这个文件夹还是空的'}</h2><p>{query()?'试试其他文件名或全文关键词。':'可导入 Markdown、PDF / PPT / PPTX 和图片，也可先创建文件夹。'}</p><Show when={!query()}><md-filled-tonal-button disabled={busy()} onClick={()=>pickImport()}>导入到当前文件夹</md-filled-tonal-button><md-text-button disabled={busy()} onClick={()=>open('mkdir',[])}>新建文件夹</md-text-button></Show></div></Show>
      <For each={rows()}>{t=>{
       const s=summaryMap().get(t.path)
       const rank=()=>readingList().findIndex(item=>item.path===t.path)+1
@@ -372,6 +512,21 @@ export const FilesScreen:Component<Props>=(props)=>{
        ]}/>
       </div>
      }}</For>
+     <Show when={query().trim().length>=2&&(ftsLoading()||ftsHits().length>0)}>
+      <div class="fb-fts-section">
+       <div class="fb-fts-heading">全文检索匹配{ftsLoading()?' · 搜索中…':` (${ftsHits().length})`}</div>
+       <For each={ftsHits()}>{hit=>{
+        const p=hit.legacy_path||hit.title
+        return <div class="fb-row fb-fts-row" role="option" aria-selected={previewPath()===p} onClick={()=>{if(requestDraftLeave())setPreviewPath(p)}}>
+         <span class="fb-type-icon"><IconDescription size={20}/></span>
+         <div class="fb-name">
+          <span class="fb-basename">{hit.title}<span class="fb-meta"> · {parentPath(p)||'根目录'}</span></span>
+          <span class="fb-fts-snippet">{(hit.snippet||'').replace(/<\/?mark>/g,'')}</span>
+         </div>
+        </div>
+       }}</For>
+      </div>
+     </Show>
     </div>
     <footer class="fb-footer"><span>{rows().length} 项{selected().size?` · 已选 ${selected().size}`:''}</span><span>{currentDir()||'根目录'}</span></footer>
    </main>
@@ -458,6 +613,9 @@ export const FilesScreen:Component<Props>=(props)=>{
         <h2 class="fb-detail-title md-typescale-title-small" title={previewPath()!}>{basename(previewPath()!)}</h2>
        </div>
        <div class="fb-detail-actions">
+        <Show when={!/\.(pdf|ppt|pptx)$/i.test(previewPath()!)}>
+         <md-text-button disabled={busy()} onClick={()=>void openRevisions(previewPath()!)}>历史版本</md-text-button>
+        </Show>
         <md-text-button onClick={closePreview}>
          <md-icon slot="icon"><IconArrowBack size={18} /></md-icon>
          返回阅读清单
@@ -530,6 +688,50 @@ export const FilesScreen:Component<Props>=(props)=>{
     <div class="fb-dialog-actions">
      <button type="button" disabled={readingActionBusy()} onClick={()=>setRemoveTarget(null)}>取消</button>
      <button type="button" style={{color:'var(--md-sys-color-error)'}} disabled={readingActionBusy()} onClick={confirmRemove}>移出</button>
+    </div>
+   </dialog>
+  </Show>
+  <Show when={trashOpen()}>
+   <dialog ref={dialogRef} class="fb-dialog fb-dialog--wide" onCancel={e=>{e.preventDefault();if(!trashBusy()){setTrashOpen(false);restoreFocus()}}}>
+    <h2>回收站</h2>
+    <p>已删除的文件夹与笔记可在此恢复，或彻底清空（有制卡溯源的笔记清空后仍保留溯源保护）。</p>
+    <div class="fb-trash-list">
+     <Show when={!trashBusy()&&!trashData().notebooks.length&&!trashData().notes.length}><p class="fb-empty-inline">回收站为空</p></Show>
+     <For each={trashData().notebooks}>{nb=><div class="fb-trash-row"><div><strong>[文件夹] {nb.legacy_path||nb.title}</strong><small>删除于 {fmtTs(nb.deleted_at??nb.updated_at)}</small></div><button type="button" disabled={trashBusy()} onClick={()=>void restoreTrashItem('notebook',nb.id)}>恢复</button></div>}</For>
+     <For each={trashData().notes}>{n=><div class="fb-trash-row"><div><strong>{n.legacy_path||n.title}</strong><small>删除于 {fmtTs(n.deleted_at??n.updated_at)}</small></div><button type="button" disabled={trashBusy()} onClick={()=>void restoreTrashItem('note',n.id)}>恢复</button></div>}</For>
+    </div>
+    <div class="fb-dialog-actions">
+     <Show when={trashData().notebooks.length>0||trashData().notes.length>0}>
+      <button type="button" style={{color:'var(--md-sys-color-error)'}} disabled={trashBusy()} onClick={()=>void emptyTrash()}>清空回收站</button>
+     </Show>
+     <button type="button" disabled={trashBusy()} onClick={()=>{setTrashOpen(false);restoreFocus()}}>关闭</button>
+    </div>
+   </dialog>
+  </Show>
+  <Show when={revOpen()&&previewPath()}>
+   <dialog ref={dialogRef} class="fb-dialog fb-dialog--wide" onCancel={e=>{e.preventDefault();if(!revBusy()){setRevOpen(false);restoreFocus()}}}>
+    <h2>历史版本 · {basename(previewPath()!)}</h2>
+    <Show when={!revBusy()&&!revList().length}><p class="fb-empty-inline">暂无历史版本快照（编辑或覆盖笔记时会自动保存历史快照）。</p></Show>
+    <Show when={revList().length>0}>
+     <div class="fb-rev-layout">
+      <div class="fb-rev-list">
+       <For each={revList()}>{rev=><button type="button" class="fb-rev-item" classList={{'fb-rev-item--active':revDetail()?.id===rev.id}} disabled={revBusy()} onClick={()=>void selectRevision(previewPath()!,rev.id)}>
+        <strong>#{rev.id} · {rev.reason}</strong>
+        <small>{fmtTs(rev.created_at)} · {rev.byte_length} B · {rev.body_sha.slice(0,8)}</small>
+       </button>}</For>
+      </div>
+      <div class="fb-rev-preview">
+       <Show when={revDetail()} fallback={<p class="fb-empty-inline">选择左侧版本查看内容</p>}>
+        <pre class="fb-rev-code">{revDetail()!.body}</pre>
+       </Show>
+      </div>
+     </div>
+    </Show>
+    <div class="fb-dialog-actions">
+     <Show when={revDetail()}>
+      <button type="button" style={{background:'var(--md-sys-color-primary)',color:'var(--md-sys-color-on-primary)'}} disabled={revBusy()} onClick={()=>void rollbackRevision(previewPath()!,revDetail()!.id)}>回滚到此版本</button>
+     </Show>
+     <button type="button" disabled={revBusy()} onClick={()=>{setRevOpen(false);restoreFocus()}}>关闭</button>
     </div>
    </dialog>
   </Show>

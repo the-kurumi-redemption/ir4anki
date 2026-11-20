@@ -242,33 +242,43 @@ async def main():
               all(_entry(p) is None for p in (B_NEW3, "解剖/占位.md")),
               [e["path"] for e in _state()["list"]])
 
-        print("== 11. upload: .md + folder subtree + image prefix + ref rewrite ==")
+        print("== 11. upload: .md + folder subtree + :/resource_id + GC safety ==")
+        eng = backend._storage()
         # single .md upload into a subdir
         r = await c.post("/api/files/upload", data={
             "rel_paths": "新笔记.md", "dir": "2027", "on_conflict": "error"},
             files={"files": ("新笔记.md", NOTE_BODY.encode(), "text/markdown")})
         check("upload single .md ok", r.json().get("ok") is True, r.text[:250])
-        check("uploaded file landed in the target dir",
-              (NOTES / "2027" / "新笔记.md").exists())
+        raw_new = await c.get("/api/files/raw", params={"path": "2027/新笔记.md"})
+        check("uploaded file readable via /api/files/raw",
+              raw_new.status_code == 200 and "2027/新笔记.md" == raw_new.json().get("path"),
+              raw_new.text[:200])
         # a note + its image where the image BASENAME already exists in the
-        # corpus (2026/pic.png from §3) → image auto-prefixed + ref rewritten
+        # corpus (2026/pic.png from §3) → Joplin UUID resource + :/id rewrite
         files = [
             ("files", ("图解.md", NOTE_WITH_IMG.encode(), "text/markdown")),
-            ("files", ("pic.png", b"\x89PNG\r\n\x1a\n", "image/png")),
+            ("files", ("pic.png", b"\x89PNG\r\n\x1a\nnew-pic", "image/png")),
         ]
         data = {"rel_paths": ["图解.md", "pic.png"], "dir": "", "on_conflict": "error"}
         r = await c.post("/api/files/upload", data=data, files=files)
         check("upload note+image ok", r.json().get("ok") is True, r.text[:300])
-        renamed = r.json().get("images_renamed") or {}
-        check("image basename collision auto-renamed", "pic.png" in renamed,
-              renamed)
-        new_img = renamed.get("pic.png")
-        if new_img:
-            check("prefixed image written to disk", (NOTES / new_img).exists(), new_img)
-            md_text = (NOTES / "图解.md").read_text(encoding="utf-8")
-            check("md image reference rewritten to the prefixed name",
-                  f"]({new_img})" in md_text and "](pic.png)" not in md_text,
+        imported_res = r.json().get("imported_resources") or []
+        check("image ingested into flat media sandbox with UUID",
+              len(imported_res) == 1 and bool(imported_res[0].get("resource_id")),
+              imported_res)
+        if imported_res:
+            rid = imported_res[0]["resource_id"]
+            res_resp = await c.get(f"/api/resources/{rid}")
+            check("resource served via /api/resources/{id}",
+                  res_resp.status_code == 200 and res_resp.content == b"\x89PNG\r\n\x1a\nnew-pic",
+                  res_resp.status_code)
+            raw_pic_note = await c.get("/api/files/raw", params={"path": "图解.md"})
+            md_text = raw_pic_note.json().get("text", "")
+            check("md image reference rewritten to Joplin :/resource_id",
+                  f"](:/{rid})" in md_text and "](pic.png)" not in md_text,
                   md_text)
+            check("imported image survives gc_unreferenced_resources",
+                  eng.gc_unreferenced_resources() == 0 and eng.get_resource(rid) is not None)
 
         print("== 12. upload conflict policy ==")
         # re-upload 新笔记.md into 2027 → 409 with error policy
@@ -282,7 +292,7 @@ async def main():
         check("409 detail lists the conflicting path",
               "新笔记.md" in (detail.get("conflicts") or []), detail)
         # skip policy → skipped, original untouched
-        before = (NOTES / "2027" / "新笔记.md").read_text(encoding="utf-8")
+        before = (await c.get("/api/files/raw", params={"path": "2027/新笔记.md"})).json()["text"]
         r = await c.post("/api/files/upload", data={
             "rel_paths": "新笔记.md", "dir": "2027", "on_conflict": "skip"},
             files={"files": ("新笔记.md", ("# 不同\n\n另一段内容。\n").encode(), "text/markdown")})
@@ -290,20 +300,22 @@ async def main():
         saved = r.json().get("saved") or []
         check("skip policy reports skipped", any(s.get("action") == "skipped" for s in saved), saved)
         check("skip policy left the original untouched",
-              (NOTES / "2027" / "新笔记.md").read_text(encoding="utf-8") == before)
+              (await c.get("/api/files/raw", params={"path": "2027/新笔记.md"})).json()["text"] == before)
         # rename policy → creates 新笔记 (1).md
         r = await c.post("/api/files/upload", data={
             "rel_paths": "新笔记.md", "dir": "2027", "on_conflict": "rename"},
             files={"files": ("新笔记.md", NOTE_BODY.encode(), "text/markdown")})
         check("upload rename policy ok", r.json().get("ok") is True, r.text[:200])
         check("rename policy created 新笔记 (1).md",
-              (NOTES / "2027" / "新笔记 (1).md").exists())
+              eng.get_note_by_legacy_path("2027/新笔记 (1).md") is not None)
 
-        print("== 13. upload rejects non-md/non-image + traversal ==")
+        print("== 13. upload skips unsupported non-md + rejects traversal ==")
         r = await c.post("/api/files/upload", data={
             "rel_paths": "x.txt", "dir": "", "on_conflict": "error"},
             files={"files": ("x.txt", b"hello", "text/plain")})
-        check("upload .txt → 400", r.status_code == 400, r.status_code)
+        check("upload .txt → 200 non-blocking skip",
+              r.status_code == 200 and any(s.get("path") == "x.txt" for s in r.json().get("skipped", [])),
+              (r.status_code, r.text[:200]))
         r = await c.post("/api/files/upload", data={
             "rel_paths": "../逃逸.md", "dir": "", "on_conflict": "error"},
             files={"files": ("逃逸.md", NOTE_BODY.encode(), "text/markdown")})

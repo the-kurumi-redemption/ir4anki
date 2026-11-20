@@ -59,6 +59,12 @@ export function trackChunkSelection(
       return
     }
     if (sel.isCollapsed) return
+    const startEl = (
+      r.startContainer.nodeType === Node.ELEMENT_NODE
+        ? r.startContainer
+        : r.startContainer.parentElement
+    ) as HTMLElement | null
+    if (startEl?.closest?.('[data-ai-layer]')) return
     const text = sel.toString().trim()
     if (!text) return
     setSelText(text)
@@ -70,7 +76,11 @@ export function trackChunkSelection(
       if (node.nodeType === Node.ELEMENT_NODE) {
         const el = node as HTMLElement
         if (/^(LI|P|H[1-6]|TD|TH|BLOCKQUOTE)$/.test(el.tagName)) {
-          block = (el.textContent || '').replace(/\s+/g, ' ').trim()
+          const clone = el.cloneNode(true) as HTMLElement
+          for (const aiEl of Array.from(clone.querySelectorAll('[data-ai-layer]'))) {
+            aiEl.remove()
+          }
+          block = (clone.textContent || '').replace(/\s+/g, ' ').trim()
           break
         }
       }

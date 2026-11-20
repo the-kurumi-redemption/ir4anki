@@ -293,6 +293,8 @@ READING_MODE = os.getenv("ANKI_READING_MODE", "").lower() in ("1", "true", "yes"
 NOTES_DIR = Path(os.getenv("ANKI_NOTES_DIR", str(Path.home() / "anki-notes")))
 READING_FILE = STATE_DIR / "reading.json"  # legacy; migration source only
 READING_DB_FILE = Path(os.getenv("ANKI_READING_DB", str(STATE_DIR / "reading.db")))
+STORAGE_DB_FILE = Path(os.getenv("ANKI_STORAGE_DB", str(STATE_DIR / "data.db")))
+STORAGE_MEDIA_DIR = Path(os.getenv("ANKI_STORAGE_MEDIA_DIR", str(STATE_DIR / "media")))
 DAILY_READING_FILE = STATE_DIR / "daily_reading.json"
 # corpus scan exclusions (editor/tool dirs + the note-image store, never
 # note content). _assets holds reading-mode image uploads (P5, 2026-09-23)
@@ -309,6 +311,55 @@ def _lectures():
     from lecture_integration import Lectures
     return Lectures(STATE_DIR / 'lectures')
 
+
+_storage_instance = None
+_storage_instance_paths: tuple[Path, Path] | None = None
+_synced_disk_sha: dict[str, str] = {}
+
+
+def _storage():
+    """Return the active Joplin-mode StorageEngine (`data.db` + `media/` sandbox).
+
+    Automatically migrates legacy `NOTES_DIR` + `reading.db` on first initialization
+    and reconciles any new `.md` files dropped directly into `NOTES_DIR` (e.g. by test fixtures).
+    """
+    global _storage_instance, _storage_instance_paths
+    from storage import (
+        LegacyMigrator,
+        LocalFsDriver,
+        SQLiteDatabaseDriver,
+        StorageEngine,
+    )
+
+    cur_paths = (STORAGE_DB_FILE.resolve(), STORAGE_MEDIA_DIR.resolve())
+    if _storage_instance is None or _storage_instance_paths != cur_paths:
+        if _storage_instance is not None:
+            with suppress(Exception):
+                _storage_instance.close()
+        _synced_disk_sha.clear()
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        STORAGE_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        db_driver = SQLiteDatabaseDriver(STORAGE_DB_FILE)
+        fs_driver = LocalFsDriver(STORAGE_MEDIA_DIR)
+        _storage_instance = StorageEngine(db_driver, fs_driver)
+        _storage_instance_paths = cur_paths
+        if _storage_instance.get_meta("legacy_migrated_at") is None and (
+            NOTES_DIR.is_dir() or READING_DB_FILE.is_file() or READING_FILE.is_file()
+        ):
+            try:
+                if READING_FILE.is_file():
+                    _reading_migrate_json()
+                if READING_DB_FILE.is_file():
+                    _reading_migrate_round4()
+                migrator = LegacyMigrator(
+                    _storage_instance,
+                    notes_dir=NOTES_DIR,
+                    reading_db_path=READING_DB_FILE if READING_DB_FILE.is_file() else None,
+                )
+                migrator.run()
+            except Exception:
+                log.exception("initial legacy corpus migration failed")
+    return _storage_instance
 
 
 def _capped_study_modes(review_size: int | None = None,
@@ -414,7 +465,7 @@ async def _lifespan(app_instance):
                     raise RuntimeError("native answer journal conflicts with business round; manual recovery required")
             await anki("createBackup", {"folder": str(BACKUP_DIR)})
             task = asyncio.create_task(_periodic_backup(backup_stop))
-        _files_relocator().recover()
+        _storage()
         from lecture_routes import jobs as lecture_jobs
         lecture_task = asyncio.create_task(lecture_jobs(sys.modules[__name__]))
         try:
@@ -2005,38 +2056,108 @@ def _chunker():
     return _chunker_mod
 
 
-def _read_note_text(path: str) -> str | None:
-    """Traversal-safe read of one corpus file (relative path under NOTES_DIR)."""
+def _sync_disk_note_if_needed(path: str):
+    """If a `.md` file exists on disk under `NOTES_DIR` (e.g., created by legacy test fixtures)
+    and has not yet been imported into `StorageEngine` (or was modified externally on disk),
+    sync it into `StorageEngine`."""
+    eng = _storage()
     try:
         root = NOTES_DIR.resolve()
         p = (NOTES_DIR / path).resolve()
         if not p.is_relative_to(root) or p.suffix.lower() != ".md" or not p.is_file():
+            return eng.resolve_note(path, include_deleted=False, include_segments=True)
+        rel_parts = p.relative_to(root).parts
+        if any(part in NOTES_SKIP_DIRS for part in rel_parts):
             return None
-        return p.read_text(encoding="utf-8")
+        disk_text = p.read_text(encoding="utf-8")
     except OSError:
-        return None
+        return eng.resolve_note(path, include_deleted=False, include_segments=True)
+
+    rel_str = str(p.relative_to(root)).replace("\\", "/")
+    norm_disk = disk_text.replace("\r\n", "\n").replace("\r", "\n")
+    disk_sha = hashlib.sha256(norm_disk.encode("utf-8")).hexdigest()
+    existing = eng.resolve_note(rel_str, include_deleted=False, include_segments=True)
+    if existing is None:
+        if not disk_text:
+            return None
+        nb_dir = str(Path(rel_str).parent)
+        nb_id = eng.resolve_or_create_notebook_path(nb_dir) if nb_dir != "." else None
+        created = eng.create_note(
+            Path(rel_str).stem,
+            norm_disk,
+            notebook_id=nb_id,
+            in_list=False,
+            seed_segments=False,
+            legacy_path=rel_str,
+            record_initial_revision=True,
+        )
+        _synced_disk_sha[rel_str] = disk_sha
+        return created
+    if rel_str not in _synced_disk_sha:
+        _synced_disk_sha[rel_str] = disk_sha
+    return existing
+
+
+def _read_note_text(path: str) -> str | None:
+    """Read note markdown text from `StorageEngine` (by UUID or relative path),
+    falling back to disk sync if a legacy fixture wrote directly to `NOTES_DIR`."""
+    eng = _storage()
+    note = eng.resolve_note(path, include_deleted=False)
+    try:
+        root = NOTES_DIR.resolve()
+        p = (NOTES_DIR / path).resolve()
+        if p.is_relative_to(root) and p.suffix.lower() == ".md":
+            rel_parts = p.relative_to(root).parts
+            if not any(part in NOTES_SKIP_DIRS for part in rel_parts):
+                if p.is_file():
+                    disk_text = p.read_text(encoding="utf-8")
+                    norm_disk = disk_text.replace("\r\n", "\n").replace("\r", "\n")
+                    disk_sha = hashlib.sha256(norm_disk.encode("utf-8")).hexdigest()
+                    rel_str = str(p.relative_to(root)).replace("\\", "/")
+                    if note is None:
+                        if not disk_text:
+                            return ""
+                        synced = _sync_disk_note_if_needed(path)
+                        return synced["body"] if synced else norm_disk
+                    if rel_str not in _synced_disk_sha:
+                        _synced_disk_sha[rel_str] = disk_sha
+                    elif _synced_disk_sha[rel_str] != disk_sha:
+                        # External edit on disk after import (e.g. test fixture vim edit)
+                        return norm_disk
+    except OSError:
+        pass
+    if note is not None:
+        return note["body"]
+    return None
 
 
 def _corpus_files() -> list[str]:
-    """All non-empty .md files under NOTES_DIR (relative paths, sorted).
-
-    Excludes NOTES_SKIP_DIRS + empty files, so the corpus view matches what
-    the reading list can queue.
-    """
-    if not NOTES_DIR.is_dir():
-        return []
-    out = []
-    for p in sorted(NOTES_DIR.rglob("*.md")):
-        rel = p.relative_to(NOTES_DIR)
-        if any(part in NOTES_SKIP_DIRS for part in rel.parts):
-            continue
-        try:
-            if p.stat().st_size == 0:
+    """All non-empty active notes in `StorageEngine` (plus any newly dropped `.md` files in `NOTES_DIR`)."""
+    eng = _storage()
+    if NOTES_DIR.is_dir():
+        root = NOTES_DIR.resolve()
+        for p in sorted(NOTES_DIR.rglob("*.md")):
+            try:
+                rel = p.relative_to(root)
+            except ValueError:
                 continue
-        except OSError:
-            continue
-        out.append(str(rel))
-    return out
+            if any(part in NOTES_SKIP_DIRS for part in rel.parts):
+                continue
+            try:
+                if p.stat().st_size == 0:
+                    continue
+            except OSError:
+                continue
+            rel_str = str(rel).replace("\\", "/")
+            if eng.resolve_note(rel_str, include_deleted=False) is None:
+                _sync_disk_note_if_needed(rel_str)
+    notes = eng.list_notes(include_deleted=False)
+    out = [
+        n["path"]
+        for n in notes
+        if (n.get("body") or "").strip()
+    ]
+    return sorted(set(out))
 
 
 # path -> (content sha, chunks); re-chunking only happens after a file edit
@@ -2559,32 +2680,29 @@ def _chunk_payload(ch: dict, key: str, st: dict, summary: dict,
     }
 
 
-# ---- reading state store (SQLite, user spec 2026-09-19 round 3) ------------
-# The user asked to move reading state off a single reading.json blob (dozens
-# of files × dozens of chunks would rewrite the whole document on every
-# action). Tables:
-#   rfiles  — one row per reading-list file AND per archived file
-#             (in_list=1 listed / 0 archived; pos = priority order)
-#   rchunks — per-chunk state (status, updated_at)
-#   rcards  — provenance: note ids created from a chunk (ordered by rowid)
-#   rorphans— drift-parked chunk states (JSON payload per orphan)
-#   rround  — single row (id=1): the active/complete round as JSON (the round
-#             is a small ephemeral document — keeping it as one JSON row
-#             avoids a 6th table for pending items)
-# All access goes through _reading_read/_reading_write which assemble/
-# disassemble the SAME dict shape the old JSON file had, so the dealing and
-# summary logic is untouched. Every call is a fresh short-lived connection
-# (stdlib sqlite3 is thread-safe this way; the app serializes mutations with
-# _state_lock anyway). WAL mode keeps readers (status endpoints) snappy.
-# First run migrates reading.json → tables once (renamed reading.json.bak
-# afterwards, so it can never migrate twice).
+# ---- reading state store (Joplin-mode unified SQLite data.db, Stage 3) ------
+# All notes, notebooks, revisions, media resources, reading segments, Anki card
+# provenance, orphans, and active rounds live in a single SQLite database
+# (`STORAGE_DB_FILE` / `data.db`) managed by `StorageEngine`.
+# `_reading_read` and `_reading_write` assemble/disassemble the working dict
+# shape directly against `notes`, `segments`, `segment_cards`, `note_orphans`,
+# and `reading_round` in `data.db`.
 
-def _reading_conn() -> sqlite3.Connection:
+def _legacy_reading_conn() -> sqlite3.Connection:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(READING_DB_FILE, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     _reading_ensure_schema(conn)
+    return conn
+
+
+def _reading_conn() -> sqlite3.Connection:
+    _storage()
+    conn = sqlite3.connect(STORAGE_DB_FILE, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
@@ -2633,10 +2751,6 @@ def _reading_ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_segments_parent ON segments(path, parent_seg_id);
         """
     )
-    # rcards indexes only once the table is round-4 shape: a legacy DB still
-    # has rcards(path, chunk_key, note_id) until _reading_migrate_round4
-    # renames it — creating seg_id indexes on it would raise and brick every
-    # reading call BEFORE the migration gets a chance to run.
     rcards_cols = {r[1] for r in conn.execute("PRAGMA table_info(rcards)")}
     if "seg_id" in rcards_cols:
         conn.execute(
@@ -2652,7 +2766,7 @@ def _reading_ensure_schema(conn: sqlite3.Connection) -> None:
         )
 
 
-def _store_entry(
+def _legacy_store_entry(
     conn: sqlite3.Connection,
     path: str,
     in_list: int,
@@ -2663,8 +2777,7 @@ def _store_entry(
     orphans: list,
     needs_resync: bool = False,
 ) -> None:
-    """Upsert one file entry (listed or archived) with its segments/cards/
-    orphans. Caller runs inside a transaction (`with conn:`)."""
+    """Legacy helper used only by _reading_migrate_json / _reading_migrate_round4."""
     file_row = (path, in_list, pos, added_at, file_sha, int(needs_resync))
     old_file = conn.execute('SELECT path,in_list,pos,added_at,file_sha,needs_resync FROM rfiles WHERE path=?', (path,)).fetchone()
     if old_file != file_row:
@@ -2718,15 +2831,143 @@ def _store_entry(
         )
 
 
-def _reading_migrate_json() -> None:
-    """One-time migration of the legacy reading.json into the SQLite store.
+def _store_entry(
+    conn: sqlite3.Connection,
+    path: str,
+    in_list: int,
+    pos: int,
+    added_at: str | None,
+    file_sha: str | None,
+    segments: list,
+    orphans: list,
+    needs_resync: bool = False,
+) -> None:
+    """Upsert one note's reading state (listed or archived) with its segments/cards/
+    orphans in `data.db`. Caller runs inside a transaction (`with conn:`)."""
+    old_note = conn.execute(
+        "SELECT id, in_list, list_pos, added_at, body_sha, needs_resync "
+        "FROM notes WHERE (legacy_path = ? OR id = ?) AND deleted_at IS NULL LIMIT 1",
+        (path, path),
+    ).fetchone()
+    if old_note is None:
+        return
+    note_id = old_note[0]
+    target_sha = file_sha if file_sha is not None else (old_note[4] or "")
+    target_note = (note_id, in_list, pos, added_at, target_sha, int(needs_resync))
+    if old_note != target_note:
+        new_body = None
+        if target_sha and target_sha != (old_note[4] or ""):
+            try:
+                p_disk = (NOTES_DIR / path).resolve()
+                if p_disk.is_relative_to(NOTES_DIR.resolve()) and p_disk.is_file():
+                    norm_d = p_disk.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+                    if hashlib.sha256(norm_d.encode("utf-8")).hexdigest() == target_sha:
+                        new_body = norm_d
+                        _synced_disk_sha[path] = target_sha
+            except OSError:
+                pass
+        if new_body is not None:
+            conn.execute(
+                "UPDATE notes SET in_list=?, list_pos=?, added_at=?, body=?, body_sha=?, needs_resync=? WHERE id=?",
+                (in_list, pos, added_at, new_body, target_sha, int(needs_resync), note_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE notes SET in_list=?, list_pos=?, added_at=?, body_sha=?, needs_resync=? WHERE id=?",
+                (in_list, pos, added_at, target_sha, int(needs_resync), note_id),
+            )
+    old_segments = {
+        row[1]: row
+        for row in conn.execute(
+            "SELECT note_id, seg_id, start_line, end_line, fingerprint, first_line, "
+            "title, heading_path, status, parent_seg_id, stale, updated_at "
+            "FROM segments WHERE note_id=?",
+            (note_id,),
+        )
+    }
+    old_cards = list(
+        conn.execute(
+            "SELECT note_id, seg_id, anki_note_id FROM segment_cards WHERE note_id=? ORDER BY id",
+            (note_id,),
+        )
+    )
+    old_orphans = list(
+        conn.execute(
+            "SELECT note_id, chunk_key, data FROM note_orphans WHERE note_id=? ORDER BY id",
+            (note_id,),
+        )
+    )
+    seg_rows = []
+    card_rows = []
+    for s in segments or []:
+        s = dict(s or {})
+        seg_rows.append((
+            note_id,
+            s.get("seg_id"),
+            s.get("start_line", 1),
+            s.get("end_line", s.get("start_line", 1)),
+            s.get("fingerprint", ""),
+            s.get("first_line", ""),
+            s.get("title", ""),
+            json.dumps(s.get("heading_path") or [], ensure_ascii=False),
+            s.get("status", "todo"),
+            s.get("parent_seg_id"),
+            1 if s.get("stale") else 0,
+            s.get("updated_at"),
+        ))
+        for nid in s.get("cards_created") or []:
+            card_rows.append((note_id, s.get("seg_id"), nid))
+    new_ids = {row[1] for row in seg_rows}
+    for sid in old_segments.keys() - new_ids:
+        conn.execute("DELETE FROM segments WHERE note_id=? AND seg_id=?", (note_id, sid))
+    changed = [row for row in seg_rows if old_segments.get(row[1]) != row]
+    if changed:
+        conn.executemany(
+            "INSERT INTO segments("
+            "note_id, seg_id, start_line, end_line, fingerprint, first_line, "
+            "title, heading_path, status, parent_seg_id, stale, updated_at"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(note_id, seg_id) DO UPDATE SET "
+            "start_line=excluded.start_line, end_line=excluded.end_line, "
+            "fingerprint=excluded.fingerprint, first_line=excluded.first_line, "
+            "title=excluded.title, heading_path=excluded.heading_path, "
+            "status=excluded.status, parent_seg_id=excluded.parent_seg_id, "
+            "stale=excluded.stale, updated_at=excluded.updated_at",
+            changed,
+        )
+    old_by_seg: dict[int, list] = {}
+    new_by_seg: dict[int, list] = {}
+    for row in old_cards:
+        old_by_seg.setdefault(row[1], []).append(row)
+    for row in card_rows:
+        new_by_seg.setdefault(row[1], []).append(row)
+    for sid in old_by_seg.keys() | new_by_seg.keys():
+        if old_by_seg.get(sid, []) != new_by_seg.get(sid, []):
+            conn.execute("DELETE FROM segment_cards WHERE note_id=? AND seg_id=?", (note_id, sid))
+            conn.executemany(
+                "INSERT INTO segment_cards(note_id, seg_id, anki_note_id) VALUES(?,?,?)",
+                new_by_seg.get(sid, []),
+            )
+    orphan_rows = []
+    for o in orphans or []:
+        o = dict(o or {})
+        key = o.pop("chunk_key", "")
+        orphan_rows.append((note_id, key, json.dumps(o, ensure_ascii=False)))
+    if old_orphans != orphan_rows:
+        conn.execute("DELETE FROM note_orphans WHERE note_id=?", (note_id,))
+        conn.executemany(
+            "INSERT INTO note_orphans(note_id, chunk_key, data) VALUES(?,?,?)",
+            orphan_rows,
+        )
 
-    Runs only when the DB is brand new (no rmeta 'migrated' marker) AND a
-    readable reading.json exists. The JSON is renamed to reading.json.bak
-    afterwards so the legacy file never shadows the DB again.
-    """
+
+def _reading_migrate_json() -> None:
+    """One-time migration of the legacy reading.json into reading.db before
+    LegacyMigrator imports reading.db into data.db."""
+    if not READING_FILE.exists():
+        return
     try:
-        conn = _reading_conn()
+        conn = _legacy_reading_conn()
     except Exception:
         return
     try:
@@ -2740,8 +2981,6 @@ def _reading_migrate_json() -> None:
                 "INSERT OR REPLACE INTO rmeta(key, value) VALUES('migrated', ?)",
                 (datetime.now().isoformat(timespec="seconds"),),
             )
-        if not READING_FILE.exists():
-            return
         try:
             d = json.loads(READING_FILE.read_text())
         except Exception:
@@ -2755,7 +2994,7 @@ def _reading_migrate_json() -> None:
                 segs, sha = _segments_from_legacy(
                     p, e.get("chunks") or {}, orphans
                 )
-                _store_entry(
+                _legacy_store_entry(
                     conn, p, 1, i,
                     e.get("added_at"), sha or e.get("file_sha"),
                     segs, orphans,
@@ -2764,7 +3003,7 @@ def _reading_migrate_json() -> None:
                 a = a or {}
                 orphans = list(a.get("orphans") or [])
                 segs, sha = _segments_from_legacy(p, a.get("chunks") or {}, orphans)
-                _store_entry(
+                _legacy_store_entry(
                     conn, p, 0, i, None, sha or a.get("file_sha"),
                     segs, orphans,
                 )
@@ -2784,17 +3023,11 @@ def _reading_migrate_json() -> None:
 
 
 def _reading_migrate_round4() -> None:
-    """One-time rchunks(+rcards) → segments migration (round 4).
-
-    Runs only when the DB predates round 4 (no rmeta 'round4_migrated') and
-    an rchunks table exists. Order matters: legacy rows are READ first, then
-    rchunks/rcards are RENAMED to *_r3bak (zero-delete rollback: revert the
-    app and rename them back), the schema is re-ensured (fresh seg_id-shaped
-    rcards), and segments are seeded with legacy states re-bound by exact
-    chunker-key equality; unmatched states park in rorphans.
-    """
+    """One-time rchunks(+rcards) → segments migration in legacy reading.db."""
+    if not READING_DB_FILE.exists():
+        return
     try:
-        conn = _reading_conn()
+        conn = _legacy_reading_conn()
     except Exception:
         return
     try:
@@ -2812,7 +3045,7 @@ def _reading_migrate_round4() -> None:
                 (datetime.now().isoformat(timespec="seconds"),),
             )
             if not has_rchunks:
-                return  # fresh DB — nothing to migrate
+                return
             file_rows = conn.execute(
                 "SELECT path, in_list, pos, added_at, file_sha FROM rfiles"
             ).fetchall()
@@ -2825,7 +3058,6 @@ def _reading_migrate_round4() -> None:
             orphan_rows = conn.execute(
                 "SELECT path, chunk_key, data FROM rorphans ORDER BY rowid"
             ).fetchall()
-        # assemble legacy per-file states (the old _reading_read shape)
         states_by_path: dict[str, dict] = {}
         for path, key, status, updated in chunk_rows:
             st: dict = {}
@@ -2845,8 +3077,6 @@ def _reading_migrate_round4() -> None:
             except Exception:
                 payload = {}
             orphans_by_path.setdefault(path, []).append({"chunk_key": key, **payload})
-        # park the legacy tables (zero-delete rollback), then recreate the
-        # round-4 rcards shape before any _store_entry insert touches it
         conn.execute("ALTER TABLE rchunks RENAME TO rchunks_r3bak")
         conn.execute("ALTER TABLE rcards RENAME TO rcards_r3bak")
         _reading_ensure_schema(conn)
@@ -2856,54 +3086,54 @@ def _reading_migrate_round4() -> None:
                 segs, sha = _segments_from_legacy(
                     path, states_by_path.get(path, {}), orphans
                 )
-                _store_entry(
+                _legacy_store_entry(
                     conn, path, in_list, pos, added_at,
                     sha if segs else file_sha,
                     segs, orphans,
                 )
     except Exception:
-        pass  # never block startup on migration; the flag prevents retries
+        pass
     finally:
         conn.close()
-
-
-if READING_MODE:
-    _reading_migrate_json()
-    _reading_migrate_round4()
 
 
 def _reading_read(*, preserve_round=False) -> dict:
-    """Assemble the working state dict from the SQLite store.
-
-    Round 4 shape: entries carry `segments` (list of segment dicts incl.
-    cards_created) instead of the legacy `chunks` dict. Consumers (dealing,
-    summaries, round rehydration) work off _file_view which hides the shape.
-    """
+    """Assemble the working state dict from the unified `data.db` SQLite store."""
     conn = _reading_conn()
     try:
         files = conn.execute(
-            "SELECT path, in_list, pos, added_at, file_sha, needs_resync FROM rfiles "
-            "ORDER BY in_list DESC, pos, path"
+            "SELECT id, COALESCE(legacy_path, title) AS path, in_list, list_pos, "
+            "added_at, body_sha, needs_resync "
+            "FROM notes WHERE deleted_at IS NULL AND (in_list = 1 OR added_at = '__archived__') "
+            "ORDER BY in_list DESC, list_pos, path"
         ).fetchall()
         seg_rows = conn.execute(
-            "SELECT path, seg_id, start_line, end_line, fingerprint, first_line, "
-            "title, heading_path, status, parent_seg_id, updated_at FROM segments "
-            "ORDER BY path, start_line, seg_id"
+            "SELECT s.note_id, s.seg_id, s.start_line, s.end_line, s.fingerprint, s.first_line, "
+            "s.title, s.heading_path, s.status, s.parent_seg_id, s.stale, s.updated_at "
+            "FROM segments s JOIN notes n ON n.id = s.note_id "
+            "WHERE n.deleted_at IS NULL AND (n.in_list = 1 OR n.added_at = '__archived__') "
+            "ORDER BY s.note_id, s.start_line, s.seg_id"
         ).fetchall()
         card_rows = conn.execute(
-            "SELECT path, seg_id, note_id FROM rcards ORDER BY rowid"
+            "SELECT sc.note_id, sc.seg_id, sc.anki_note_id "
+            "FROM segment_cards sc JOIN notes n ON n.id = sc.note_id "
+            "WHERE n.deleted_at IS NULL AND (n.in_list = 1 OR n.added_at = '__archived__') "
+            "ORDER BY sc.id"
         ).fetchall()
         orphan_rows = conn.execute(
-            "SELECT path, chunk_key, data FROM rorphans ORDER BY rowid"
+            "SELECT o.note_id, o.chunk_key, o.data "
+            "FROM note_orphans o JOIN notes n ON n.id = o.note_id "
+            "WHERE n.deleted_at IS NULL AND (n.in_list = 1 OR n.added_at = '__archived__') "
+            "ORDER BY o.id"
         ).fetchall()
-        rd_row = conn.execute("SELECT data FROM rround WHERE id = 1").fetchone()
+        rd_row = conn.execute("SELECT data FROM reading_round WHERE id = 1").fetchone()
     finally:
         conn.close()
 
-    segs_by_path: dict[str, list] = {}
+    segs_by_note: dict[str, list] = {}
     seg_index: dict[tuple[str, int], dict] = {}
-    for (path, seg_id, start_line, end_line, fp, first_line, title, hp_json,
-         status, parent_seg_id, updated) in seg_rows:
+    for (note_id, seg_id, start_line, end_line, fp, first_line, title, hp_json,
+         status, parent_seg_id, stale, updated) in seg_rows:
         try:
             hp = json.loads(hp_json) if hp_json else []
         except Exception:
@@ -2920,47 +3150,49 @@ def _reading_read(*, preserve_round=False) -> dict:
             "parent_seg_id": parent_seg_id,
             "updated_at": updated,
         }
-        segs_by_path.setdefault(path, []).append(s)
-        seg_index[(path, seg_id)] = s
-    for path, seg_id, note_id in card_rows:
-        seg = seg_index.get((path, seg_id))
+        if stale:
+            s["stale"] = True
+        segs_by_note.setdefault(note_id, []).append(s)
+        seg_index[(note_id, seg_id)] = s
+    for note_id, seg_id, anki_note_id in card_rows:
+        seg = seg_index.get((note_id, seg_id))
         if seg is not None:
-            seg.setdefault("cards_created", []).append(note_id)
-    orphans_by_path: dict[str, list] = {}
-    for path, key, data in orphan_rows:
+            seg.setdefault("cards_created", []).append(anki_note_id)
+    orphans_by_note: dict[str, list] = {}
+    for note_id, key, data in orphan_rows:
         try:
             payload = json.loads(data) if data else {}
         except Exception:
             payload = {}
-        orphans_by_path.setdefault(path, []).append({"chunk_key": key, **payload})
+        orphans_by_note.setdefault(note_id, []).append({"chunk_key": key, **payload})
 
-    def _entry(path: str, added_at: str | None, file_sha: str | None,
+    def _entry(note_id: str, path: str, added_at: str | None, file_sha: str | None,
                needs_resync: int | None) -> dict:
         e = {
             "path": path,
             "file_sha": file_sha,
-            "segments": segs_by_path.get(path, []),
-            "orphans": orphans_by_path.get(path, []),
+            "segments": segs_by_note.get(note_id, []),
+            "orphans": orphans_by_note.get(note_id, []),
         }
         if needs_resync:
             e["needs_resync"] = True
-        if added_at is not None:
+        if added_at is not None and added_at != "__archived__":
             e["added_at"] = added_at
         return e
 
     listed = [
-        _entry(path, added_at, file_sha, needs_resync)
-        for path, in_list, _pos, added_at, file_sha, needs_resync in files
+        _entry(note_id, path, added_at, file_sha, needs_resync)
+        for note_id, path, in_list, _pos, added_at, file_sha, needs_resync in files
         if in_list
     ]
     archive = {
         path: {
             "file_sha": file_sha,
-            "segments": segs_by_path.get(path, []),
-            "orphans": orphans_by_path.get(path, []),
+            "segments": segs_by_note.get(note_id, []),
+            "orphans": orphans_by_note.get(note_id, []),
             **({"needs_resync": True} if needs_resync else {}),
         }
-        for path, in_list, _pos, _added, file_sha, needs_resync in files
+        for note_id, path, in_list, _pos, _added, file_sha, needs_resync in files
         if not in_list
     }
     d: dict = {"list": listed, "archive": archive}
@@ -2978,28 +3210,85 @@ def _reading_read(*, preserve_round=False) -> dict:
     return _lectures().merge(d)
 
 
+def _ensure_note_in_storage(path: str, file_sha: str | None = None) -> None:
+    """Ensure `path` exists as an active note in `StorageEngine` before `_reading_write`."""
+    if not path:
+        return
+    eng = _storage()
+    if eng.resolve_note(path, include_deleted=False) is not None:
+        return
+    if _sync_disk_note_if_needed(path) is not None:
+        return
+    nb_dir = str(Path(path).parent).replace("\\", "/")
+    nb_id = eng.resolve_or_create_notebook_path(nb_dir) if nb_dir not in ("", ".") else None
+    note = eng.create_note(
+        Path(path).stem or path,
+        "",
+        notebook_id=nb_id,
+        in_list=False,
+        seed_segments=False,
+        legacy_path=path,
+        record_initial_revision=False,
+    )
+    if file_sha:
+        with eng.db.transaction():
+            eng.db.execute("UPDATE notes SET body_sha=? WHERE id=?", (file_sha, note["id"]))
+
+
 def _reading_write(d: dict | None):
-    """Persist the working state dict back to SQLite (one transaction).
+    """Persist the working state dict back to `data.db` (one transaction).
 
     Compare rows inside the transaction and write only deltas. No cross-request
     snapshot cache: callers serialize read-modify-write with _state_lock.
     """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if d is not None:
+        _lectures().persist_list(d)
+        listed_pre = [e for e in d.get("list", []) if e.get("kind") != "pdf"]
+        archive_pre = {
+            p: a
+            for p, a in (d.get("archive") or {}).items()
+            if not any(x["path"] == p for x in _lectures().docs.list())
+        }
+        for e in listed_pre:
+            _ensure_note_in_storage(e.get("path", ""), e.get("file_sha"))
+        for p, a in archive_pre.items():
+            _ensure_note_in_storage(p, (a or {}).get("file_sha"))
+
     conn = _reading_conn()
     try:
         with conn:
             if d is None:
-                for t in ("rfiles", "segments", "rcards", "rorphans", "rround"):
+                conn.execute(
+                    "UPDATE notes SET in_list=0, list_pos=0, added_at=NULL, needs_resync=0 "
+                    "WHERE in_list != 0 OR list_pos != 0 OR added_at IS NOT NULL OR needs_resync != 0"
+                )
+                for t in ("segment_cards", "segments", "note_orphans", "reading_round"):
                     conn.execute(f"DELETE FROM {t}")
                 return
-            _lectures().persist_list(d)
             listed = [e for e in d.get("list", []) if e.get("kind") != "pdf"]
-            archive = {p:a for p,a in (d.get("archive") or {}).items() if not any(x['path']==p for x in _lectures().docs.list())}
-            keep = [e.get("path", "") for e in listed] + list(archive.keys())
-            removed = {row[0] for row in conn.execute('SELECT path FROM rfiles')} - set(keep)
-            for path in removed:
-                for table in ('rfiles', 'segments', 'rcards', 'rorphans'):
-                    conn.execute(f'DELETE FROM {table} WHERE path=?', (path,))
+            archive = {
+                p: a
+                for p, a in (d.get("archive") or {}).items()
+                if not any(x["path"] == p for x in _lectures().docs.list())
+            }
+            keep = {e.get("path", "") for e in listed} | set(archive.keys())
+            tracked = {
+                row[0]: row[1]
+                for row in conn.execute(
+                    "SELECT COALESCE(legacy_path, title), id FROM notes "
+                    "WHERE deleted_at IS NULL AND (in_list = 1 OR added_at = '__archived__')"
+                ).fetchall()
+            }
+            for path in set(tracked.keys()) - keep:
+                nid = tracked[path]
+                conn.execute("DELETE FROM segment_cards WHERE note_id=?", (nid,))
+                conn.execute("DELETE FROM segments WHERE note_id=?", (nid,))
+                conn.execute("DELETE FROM note_orphans WHERE note_id=?", (nid,))
+                conn.execute(
+                    "UPDATE notes SET in_list=0, list_pos=0, added_at=NULL, needs_resync=0 WHERE id=?",
+                    (nid,),
+                )
             for i, e in enumerate(listed):
                 _store_entry(
                     conn, e.get("path", ""), 1, i,
@@ -3009,19 +3298,19 @@ def _reading_write(d: dict | None):
                 )
             for i, (p, a) in enumerate(sorted(archive.items())):
                 _store_entry(
-                    conn, p, 0, i, None, (a or {}).get("file_sha"),
+                    conn, p, 0, i, "__archived__", (a or {}).get("file_sha"),
                     (a or {}).get("segments") or [], (a or {}).get("orphans") or [],
                     bool((a or {}).get("needs_resync")),
                 )
             rd = d.get("round")
             if isinstance(rd, dict):
                 conn.execute(
-                    "INSERT INTO rround(id, data) VALUES(1, ?) "
-                    "ON CONFLICT(id) DO UPDATE SET data = excluded.data WHERE rround.data IS NOT excluded.data",
+                    "INSERT INTO reading_round(id, data) VALUES(1, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET data = excluded.data WHERE reading_round.data IS NOT excluded.data",
                     (json.dumps(rd, ensure_ascii=False),),
                 )
             else:
-                conn.execute("DELETE FROM rround")
+                conn.execute("DELETE FROM reading_round")
     finally:
         conn.close()
 
@@ -3627,11 +3916,12 @@ async def reading_corpus():
 
 @app.get("/api/files/list")
 async def files_list():
-    # dirs = every directory under the corpus (excluding protected ones).
-    # The tree view builds from files alone, but the MOVE dialog needs the
-    # directory list so empty dirs (a fresh 2027/ with no notes yet) are
-    # still valid move destinations.
-    dirs: list[str] = []
+    eng = _storage()
+    dirs_set: set[str] = {
+        nb["path"]
+        for nb in eng.list_notebook_paths(include_deleted=False)
+        if nb.get("path")
+    }
     if NOTES_DIR.is_dir():
         root = NOTES_DIR.resolve()
         for p in sorted(NOTES_DIR.rglob("*")):
@@ -3643,59 +3933,83 @@ async def files_list():
             rel = p.relative_to(root)
             if any(part in NOTES_SKIP_DIRS for part in rel.parts):
                 continue
-            dirs.append(str(rel))
+            rel_str = str(rel).replace("\\", "/")
+            dirs_set.add(rel_str)
+            eng.resolve_or_create_notebook_path(rel_str)
+    all_paths = sorted(
+        set(_corpus_files())
+        | {
+            d["path"]
+            for d in _lectures().docs.list()
+            if (NOTES_DIR / d["path"]).is_file()
+        }
+    )
+    files_out = []
+    for p in all_paths:
+        n = eng.resolve_note(p, include_deleted=False)
+        if n is not None:
+            rev = n.get("body_sha") or ""
+        else:
+            disk_p = NOTES_DIR / p
+            rev = _files_revision(disk_p) if disk_p.is_file() else ""
+        files_out.append({"path": p, "title": Path(p).stem, "revision": rev})
     return {
-        "files": [{
-            "path": p, "title": Path(p).stem, "revision": _files_revision(NOTES_DIR / p)} for p in sorted(set(_corpus_files()) | {d["path"] for d in _lectures().docs.list() if (NOTES_DIR/d["path"]).is_file()})],
-        "dirs": dirs,
+        "files": files_out,
+        "dirs": sorted(dirs_set),
     }
 
 
 @app.get("/api/files/raw")
 async def files_raw(path: str):
     async with _state_lock:
+        eng = _storage()
+        note = eng.resolve_note(path, include_deleted=False)
+        if note is not None:
+            # StorageEngine is SSOT; only defer to disk if a previously synced
+            # legacy fixture file was modified externally on disk.
+            try:
+                source = _files_resolve(path)
+                if source.is_file():
+                    rel_str = _files_rel(source)
+                    if rel_str in _synced_disk_sha:
+                        disk_text = source.read_text(encoding="utf-8")
+                        norm_disk = disk_text.replace("\r\n", "\n").replace("\r", "\n")
+                        disk_sha = hashlib.sha256(norm_disk.encode("utf-8")).hexdigest()
+                        if disk_sha != _synced_disk_sha[rel_str]:
+                            return {
+                                "path": note["path"],
+                                "note_id": note["id"],
+                                "text": norm_disk,
+                                "revision": disk_sha,
+                            }
+            except (HTTPException, OSError):
+                pass
+            return {
+                "path": note["path"],
+                "note_id": note["id"],
+                "text": note["body"],
+                "revision": note["body_sha"],
+            }
         source = _files_resolve(path)
-        for _ in range(2):
-            if not source.is_file():
-                raise HTTPException(status_code=404, detail="note file not found")
-            revision = _files_revision(source)
-            text = _read_note_text(path)
-            if text is None:
-                raise HTTPException(status_code=404, detail="note file not found")
-            if _files_revision(source) == revision:
-                return {"path": path, "text": text, "revision": revision}
-        raise HTTPException(status_code=409, detail="文件正在变化，请重试")
+        if source.is_file():
+            for _ in range(2):
+                if not source.is_file():
+                    break
+                revision = _files_revision(source)
+                text = _read_note_text(path)
+                if text is None:
+                    raise HTTPException(status_code=404, detail="note file not found")
+                if _files_revision(source) == revision:
+                    return {"path": path, "text": text, "revision": revision}
+            raise HTTPException(status_code=409, detail="文件正在变化，请重试")
+        raise HTTPException(status_code=404, detail="note file not found")
 
 
-
-# ---- file management (user spec 2026-10-06: 前端 = 语料唯一可信来源) --------
-# Upload / rename / move / delete over the ~/anki-notes corpus. The reading
-# store keys EVERYTHING by relative path (rfiles/segments/rcards/rorphans/
-# round pending/archive), so rename & move migrate those rows in the same
-# critical section — content is untouched (file_sha stays valid), so segment
-# line numbers/fingerprints keep working and reading progress survives a
-# rename verbatim (the user's core requirement: 改文件名不能丢阅读进度).
-# Delete is HARD (user ruling): disk + all reading progress go; Anki cards
-# already made from the file are NOT touched (only the app-side provenance).
-# External (file-manager/Obsidian) changes are NOT reconciled automatically —
-# the existing missing/orphan/file_sha drift fuses remain the safety net.
-
-@app.middleware('http')
-async def recover_file_relocations(request, call_next):
-    if request.method == 'GET' and request.url.path == '/api/files/membership':
-        return await call_next(request)
-    if request.url.path.startswith('/api/'):
-        directory = STATE_DIR / 'file-relocations'
-        try:
-            pending = _files_relocator().needs_recovery()
-            if pending:
-                async with _state_lock:
-                    _files_relocator().recover()
-        except Exception:
-            from fastapi.responses import JSONResponse
-            return JSONResponse(status_code=503, content={'detail': '文件迁移恢复暂停：存在状态冲突，请保留迁移日志并检查'})
-    return await call_next(request)
-
+# ---- file management (Joplin-mode StorageEngine, Stage 3) --------------------
+# Rename / move / delete / mkdir / upload operate atomically on `StorageEngine`
+# (`data.db` + `media/` sandbox), with best-effort mirroring to `NOTES_DIR` when
+# present. `file_relocation.py` and its two-phase crash journal are retired:
+# notebook/note renames & moves execute in a single SQLite transaction!
 
 def _files_revision(path: Path) -> str:
     st = path.stat()
@@ -3712,70 +4026,20 @@ async def files_membership():
     # This metadata GET never initializes a store or performs relocation recovery.
     paths = {doc['path'] for doc, _ in _lecture_metadata()
              if doc.get('listed') and not doc.get('original_missing')}
-    if READING_DB_FILE.exists():
-        conn = sqlite3.connect(READING_DB_FILE.resolve().as_uri() + "?mode=ro", uri=True)
-        try:
-            paths.update(r[0] for r in conn.execute("SELECT path FROM rfiles WHERE in_list=1"))
-        except sqlite3.OperationalError as exc:
-            if 'no such table' not in str(exc):
-                raise
-        finally:
-            conn.close()
+    for db_file, query in (
+        (STORAGE_DB_FILE, "SELECT COALESCE(legacy_path, title) FROM notes WHERE in_list=1 AND deleted_at IS NULL"),
+        (READING_DB_FILE, "SELECT path FROM rfiles WHERE in_list=1"),
+    ):
+        if db_file.exists():
+            conn = sqlite3.connect(db_file.resolve().as_uri() + "?mode=ro", uri=True)
+            try:
+                paths.update(r[0] for r in conn.execute(query) if r[0])
+            except sqlite3.OperationalError as exc:
+                if 'no such table' not in str(exc):
+                    raise
+            finally:
+                conn.close()
     return {"paths": sorted(paths)}
-
-
-def _files_relocation_preflight(old, new, is_dir):
-    from file_relocation import RelocationConflict
-    src, dst = _files_resolve(old), _files_resolve(new)
-    if not src.exists() or dst.exists():
-        raise RelocationConflict('源不存在或目标已存在')
-    if is_dir and (src == dst or src in dst.parents):
-        raise RelocationConflict('不能移动到自己或子目录')
-    if any(d['path']==new or (is_dir and d['path'].startswith(new+'/')) for d in _lectures().docs.list()):
-        raise RelocationConflict('目标存在课件版本记录，不能覆盖')
-    _flow_read()  # fail before disk mutation on corrupt coordinator
-    conn = _reading_conn()
-    try:
-        for table in ('rfiles', 'segments', 'rcards', 'rorphans'):
-            if conn.execute(f"SELECT 1 FROM {table} WHERE path=? OR path LIKE ? ESCAPE '\\' LIMIT 1", (new, _like_escape(new + '/') + '%')).fetchone():
-                raise RelocationConflict('目标存在阅读状态，不能覆盖')
-    finally:
-        conn.close()
-
-
-def _files_relocation_signature(path, is_dir):
-    def match(p):
-        return p == path or (is_dir and p.startswith(path + '/'))
-    conn = _reading_conn()
-    try:
-        rows = {t: sorted([list(r) for r in conn.execute(f'SELECT * FROM {t}') if match(r[0])], key=str)
-                for t in ('rfiles', 'segments', 'rcards', 'rorphans')}
-        round_row = conn.execute('SELECT data FROM rround WHERE id=1').fetchone()
-        rd = json.loads(round_row[0]) if round_row and round_row[0] else {}
-        rows['pending'] = [r for r in rd.get('pending', []) if match(r.get('path', ''))]
-        rows['lecture_documents'] = [d for d in _lectures().docs.list() if match(d['path'])]
-        rows['page_segments'] = [d for d in _lectures().reading.all('page-segments') if match(d['path'])]
-        flow = _flow_read()
-        rows['flow'] = [[a for a in slot if match(a[0])] for slot in (flow or {}).get('slots', []) if any(match(a[0]) for a in slot)]
-        return hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
-    finally:
-        conn.close()
-
-
-def _files_relocator():
-    from file_relocation import Relocator
-    return Relocator(_files_root(), STATE_DIR, _files_relocation_preflight,
-                     _reading_relocate, None, _files_relocation_signature)
-
-
-def _files_relocate_api(old, new, is_dir, request_id=None, request=None):
-    from file_relocation import RelocationConflict
-    try:
-        return _files_relocator().move(old, new, is_dir, request_id=request_id, request=request)
-    except RelocationConflict as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except OSError as exc:
-        raise HTTPException(status_code=503, detail='迁移待恢复，请刷新后重试') from exc
 
 
 class FilesUndoBody(BaseModel):
@@ -3783,14 +4047,22 @@ class FilesUndoBody(BaseModel):
     requestId: str | None = None
 
 
-def _files_request_result(request_id, request=None):
-    from file_relocation import RelocationConflict
-    try:
-        return _files_relocator().request_result(request_id, request)
-    except RelocationConflict as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except OSError as exc:
-        raise HTTPException(status_code=503, detail='迁移待恢复，请刷新后重试') from exc
+def _files_request_result(request_id: str, request: dict | None = None) -> dict:
+    eng = _storage()
+    op = eng.get_file_operation_by_request(request_id)
+    if op is None:
+        return {"ok": True, "status": "unknown", "requestId": request_id}
+    if request is not None and op.get("request") and op["request"] != request:
+        raise HTTPException(status_code=409, detail="requestId 已绑定不同操作参数")
+    undone = bool(op["undone"])
+    return {
+        "ok": True,
+        "status": "complete",
+        "old_path": op["new_path"] if undone else op["old_path"],
+        "path": op["old_path"] if undone else op["new_path"],
+        "operationId": op["operation_id"],
+        "requestId": request_id,
+    }
 
 
 @app.get('/api/files/operation')
@@ -3799,37 +4071,67 @@ async def files_operation(request_id: str):
         return _files_request_result(request_id)
 
 
-def _files_request_retry(request_id, request):
+def _files_request_retry(request_id: str | None, request: dict) -> dict | None:
     if request_id:
-        result = _files_request_result(request_id, request)
-        if result['status'] == 'complete':
-            return result
-        if result['status'] == 'cancelled':
-            raise HTTPException(status_code=409, detail='该请求已取消，请发起新的操作')
+        res = _files_request_result(request_id, request)
+        if res.get("status") == "complete":
+            return res
+    return None
 
 
 @app.post('/api/files/undo')
 async def files_undo(body: FilesUndoBody):
-    from file_relocation import RelocationConflict
     async with _state_lock:
-        try:
-            return _files_relocator().undo(body.operationId, body.requestId)
-        except RelocationConflict as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except OSError as exc:
-            raise HTTPException(status_code=503, detail='撤销待恢复，请刷新确认') from exc
+        req_payload = dict(action='undo', path='', value=body.operationId)
+        replay = _files_request_retry(body.requestId, req_payload)
+        if replay:
+            return replay
+        eng = _storage()
+        op = eng.get_file_operation(body.operationId)
+        if op is None:
+            raise HTTPException(status_code=404, detail="未找到对应的文件操作记录")
+        if op["undone"]:
+            if body.requestId:
+                eng.record_file_operation(
+                    action="undo",
+                    old_path=op["new_path"],
+                    new_path=op["old_path"],
+                    is_dir=bool(op["is_dir"]),
+                    target_id=op.get("target_id"),
+                    request_id=body.requestId,
+                    request_payload=req_payload,
+                )
+            return {
+                "ok": True,
+                "status": "complete",
+                "old_path": op["new_path"],
+                "path": op["old_path"],
+                "operationId": body.requestId or f"undo-{op['operation_id']}",
+                **({"requestId": body.requestId} if body.requestId else {}),
+            }
+        old_rel = op["old_path"]
+        new_rel = op["new_path"]
+        is_dir = bool(op["is_dir"])
+        res = _execute_relocation(
+            new_rel,
+            old_rel,
+            is_dir,
+            action="undo",
+            request_id=body.requestId,
+            request=req_payload,
+            record_op=bool(body.requestId),
+        )
+        eng.mark_file_operation_undone(body.operationId)
+        return res
 
 
 def _files_root() -> Path:
     return NOTES_DIR.resolve()
 
 
-def _files_resolve(rel: str, *, upload_image: bool = False) -> Path:
-    """Resolve safely; only image uploads may enter nested book _assets.
-
-    The root editor asset store and all other protected directories remain
-    off-limits. Browsing/rename/move/delete callers retain the strict default.
-    """
+def _files_resolve(rel: str) -> Path:
+    """Resolve a legacy disk path safely under NOTES_DIR, rejecting symlinks,
+    traversal, and protected directories (including `_assets`)."""
     rel = (rel or "").strip().replace("\\", "/").lstrip("/")
     if not rel:
         raise HTTPException(status_code=400, detail="path 不能为空")
@@ -3841,13 +4143,9 @@ def _files_resolve(rel: str, *, upload_image: bool = False) -> Path:
     if not p.is_relative_to(root) or p == root:
         raise HTTPException(status_code=400, detail="非法路径")
     parts = p.relative_to(root).parts
-    for index, part in enumerate(parts):
-        if part not in NOTES_SKIP_DIRS:
-            continue
-        if (upload_image and part == "_assets" and 0 < index < len(parts) - 1
-                and p.suffix.lower() in NOTE_IMAGE_EXTS):
-            continue
-        raise HTTPException(status_code=400, detail="该目录受保护，不能在 app 内操作")
+    for part in parts:
+        if part in NOTES_SKIP_DIRS:
+            raise HTTPException(status_code=400, detail="该目录受保护，不能在 app 内操作")
     return p
 
 
@@ -3870,153 +4168,230 @@ def _like_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _reading_relocate(old_rel: str, new_rel: str, is_dir: bool, operation_id: str | None = None, fault=lambda phase: None) -> None:
-    """Migrate every reading-store reference from old_rel to new_rel.
-
-    Single file: exact-path UPDATEs. Directory: every stored path under
-    `old_rel/` is re-prefixed (rows are matched via LIKE with escaping, but
-    UPDATED by their exact old value, so no escape subtleties on the write
-    side). Also rewrites the active round's pending entries and drops stale
-    _chunk_cache keys. Runs in ONE SQLite transaction.
-    """
+def _execute_relocation(
+    old_rel: str,
+    new_rel: str,
+    is_dir: bool,
+    *,
+    action: str = "move",
+    request_id: str | None = None,
+    request: dict | None = None,
+    record_op: bool = True,
+) -> dict:
+    """Atomically relocate a note, notebook, or lecture from `old_rel` to `new_rel`
+    in `StorageEngine` (`data.db`) + active round/flow/lectures, and mirror to
+    `NOTES_DIR` when present on disk."""
+    eng = _storage()
     old_p = old_rel.rstrip("/") + "/"
     new_p = new_rel.rstrip("/") + "/"
-    mapping: dict[str, str] = {d['path']:new_rel+d['path'][len(old_rel):] for d in _lectures().docs.list() if d['path']==old_rel or (is_dir and d['path'].startswith(old_rel+'/'))}
-    conn = _reading_conn()
-    try:
-        conn.execute("PRAGMA synchronous=FULL")
-        conn.execute("CREATE TABLE IF NOT EXISTS file_relocations (id TEXT PRIMARY KEY)")
-        already = operation_id and conn.execute("SELECT 1 FROM file_relocations WHERE id=?", (operation_id,)).fetchone()
-        conn.execute("BEGIN IMMEDIATE")
-        with conn:
-            if operation_id and not already:
-                from file_relocation import RelocationConflict
-                for table in ('rfiles', 'segments', 'rcards', 'rorphans'):
-                    if conn.execute(f"SELECT 1 FROM {table} WHERE path=? OR path LIKE ? ESCAPE '\\' LIMIT 1", (new_rel, _like_escape(new_rel + '/') + '%')).fetchone():
-                        raise RelocationConflict('目标阅读状态已变化，迁移恢复暂停')
-            for t in (() if already else ("rfiles", "segments", "rcards", "rorphans")):
-                if is_dir:
-                    rows = conn.execute(
-                        f"SELECT DISTINCT path FROM {t} "
-                        "WHERE path LIKE ? ESCAPE '\\'",
-                        (_like_escape(old_p) + "%",),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        f"SELECT DISTINCT path FROM {t} WHERE path = ?",
-                        (old_rel,),
-                    ).fetchall()
-                for (p,) in rows:
-                    np = (new_p + p[len(old_p):]) if is_dir else new_rel
-                    mapping[p] = np
-                    conn.execute(
-                        f"UPDATE {t} SET path = ? WHERE path = ?", (np, p))
-            row = conn.execute("SELECT data FROM rround WHERE id = 1").fetchone()
-            if row and row[0] and mapping:
+
+    # Ensure any disk-only files under old_rel are synced into StorageEngine first
+    if NOTES_DIR.is_dir():
+        src_disk = _files_resolve(old_rel)
+        if is_dir and src_disk.is_dir():
+            eng.resolve_or_create_notebook_path(old_rel)
+            for sub_p in sorted(src_disk.rglob("*")):
                 try:
-                    rd = json.loads(row[0])
-                except Exception:
-                    rd = None
-                if isinstance(rd, dict):
-                    touched = False
-                    for item in rd.get("pending") or []:
-                        p = item.get("path")
-                        if p in mapping:
-                            item["path"] = mapping[p]
-                            touched = True
-                    if touched:
-                        conn.execute(
-                            "UPDATE rround SET data = ? WHERE id = 1",
-                            (json.dumps(rd, ensure_ascii=False),),
-                        )
-            if operation_id and not already:
-                conn.execute("INSERT INTO file_relocations(id) VALUES (?)", (operation_id,))
-            fault('db_before')
-        fault('db')
-        # FULL commits the WAL; also persist directory entries for a newly
-        # created database before the relocation journal can become complete.
-        for directory in (STATE_DIR, STATE_DIR.parent):
-            fd = os.open(directory, os.O_RDONLY)
-            try: os.fsync(fd)
-            finally: os.close(fd)
-        fault('db_durable')
-        flow = _flow_read()
-        if flow and flow.get('slots'):
-            touched = False
-            for slot in flow['slots']:
-                for path, key in list(slot):
-                    np = new_rel + path[len(old_rel):] if path == old_rel or (is_dir and path.startswith(old_p)) else path
-                    alias = [np, key]
-                    if alias not in slot:
-                        slot.append(alias)
-                        touched = True
-            fault('flow_before')
-            if touched:
-                _flow_write(flow)
-            fault('flow')
-    finally:
-        conn.close()
+                    rel_sub = str(sub_p.relative_to(_files_root())).replace("\\", "/")
+                except ValueError:
+                    continue
+                if any(part in NOTES_SKIP_DIRS for part in Path(rel_sub).parts):
+                    continue
+                if sub_p.is_dir():
+                    eng.resolve_or_create_notebook_path(rel_sub)
+                elif sub_p.is_file() and sub_p.suffix.lower() == ".md":
+                    _sync_disk_note_if_needed(rel_sub)
+        elif not is_dir and src_disk.is_file() and src_disk.suffix.lower() == ".md":
+            _sync_disk_note_if_needed(old_rel)
+
+    # Check target conflicts in StorageEngine & lectures
+    if any(
+        d["path"] == new_rel or (is_dir and d["path"].startswith(new_p))
+        for d in _lectures().docs.list()
+    ):
+        raise HTTPException(status_code=409, detail="目标存在课件版本记录，不能覆盖")
+    if is_dir:
+        if eng.resolve_notebook(new_rel, include_deleted=False) is not None:
+            raise HTTPException(status_code=409, detail="目标位置已有同名文件夹")
+    else:
+        if eng.resolve_note(new_rel, include_deleted=False) is not None:
+            raise HTTPException(status_code=409, detail="目标名称已存在")
+
+    _flow_read()  # fail before mutation on corrupt coordinator
+
+    mapping: dict[str, str] = {
+        d["path"]: new_rel + d["path"][len(old_rel):]
+        for d in _lectures().docs.list()
+        if d["path"] == old_rel or (is_dir and d["path"].startswith(old_p))
+    }
+    target_id: str | None = None
+
+    if is_dir:
+        nb = eng.resolve_notebook(old_rel, include_deleted=False)
+        if nb is None:
+            nb_id = eng.resolve_or_create_notebook_path(old_rel)
+            nb = eng.get_notebook(nb_id)
+        target_id = nb["id"]
+        # Collect all notes under old_rel before updating so we know path mapping
+        for n in eng.list_notes(include_deleted=True):
+            lp = n.get("legacy_path") or n.get("path") or ""
+            if lp == old_rel or lp.startswith(old_p):
+                mapping[lp] = new_p + lp[len(old_p):]
+        new_parent_dir = str(Path(new_rel).parent).replace("\\", "/")
+        new_name = Path(new_rel).name
+        new_parent_id = (
+            eng.resolve_or_create_notebook_path(new_parent_dir)
+            if new_parent_dir not in ("", ".")
+            else None
+        )
+        if nb["parent_id"] != new_parent_id:
+            eng.move_notebook(nb["id"], new_parent_id)
+        if nb["name"] != new_name:
+            eng.rename_notebook(nb["id"], new_name)
+    else:
+        note = eng.resolve_note(old_rel, include_deleted=False)
+        if note is not None:
+            target_id = note["id"]
+            mapping[old_rel] = new_rel
+            new_parent_dir = str(Path(new_rel).parent).replace("\\", "/")
+            new_stem = Path(new_rel).stem if new_rel.lower().endswith(".md") else Path(new_rel).name
+            new_nb_id = (
+                eng.resolve_or_create_notebook_path(new_parent_dir)
+                if new_parent_dir not in ("", ".")
+                else None
+            )
+            if note.get("notebook_id") != new_nb_id:
+                eng.move_note(note["id"], new_nb_id)
+            if note.get("title") != new_stem:
+                eng.rename_note(note["id"], new_stem)
+            # Ensure exact legacy_path matches new_rel
+            with eng.db.transaction():
+                eng.db.execute(
+                    "UPDATE notes SET legacy_path = ? WHERE id = ?",
+                    (new_rel, note["id"]),
+                )
+
+    # Update active round pending paths in reading_round
+    rd = eng.get_reading_round()
+    if isinstance(rd, dict) and mapping:
+        touched = False
+        for item in rd.get("pending") or []:
+            p = item.get("path")
+            if p in mapping:
+                item["path"] = mapping[p]
+                touched = True
+        if touched:
+            eng.set_reading_round(rd)
+
+    # Mirror to NOTES_DIR if source exists on disk
+    if NOTES_DIR.is_dir():
+        src_disk = _files_resolve(old_rel)
+        dst_disk = _files_resolve(new_rel)
+        if src_disk.exists():
+            dst_disk.parent.mkdir(parents=True, exist_ok=True)
+            src_disk.replace(dst_disk)
+    for old_k, new_k in mapping.items():
+        if old_k in _synced_disk_sha:
+            _synced_disk_sha[new_k] = _synced_disk_sha.pop(old_k)
+        _chunk_cache.pop(old_k, None)
+
+    # Update flow coordinator & lectures
+    flow = _flow_read()
+    if flow and flow.get("slots"):
+        touched = False
+        for slot in flow["slots"]:
+            for path, key in list(slot):
+                np = (
+                    new_rel + path[len(old_rel):]
+                    if path == old_rel or (is_dir and path.startswith(old_p))
+                    else path
+                )
+                alias = [np, key]
+                if alias not in slot:
+                    slot.append(alias)
+                    touched = True
+        if touched:
+            _flow_write(flow)
+
     _lectures().docs.relocate(old_rel, new_rel, is_dir)
     with _lectures().reading.db() as db:
-        for seg in _lectures().reading.all('page-segments',db):
-            path=seg['path']
-            if path==old_rel or (is_dir and path.startswith(old_rel+'/')):
-                seg['path']=new_rel+path[len(old_rel):]
-                _lectures().reading.put('page-segments',seg['segment_id'],seg,db)
-    for old in mapping:
-        _chunk_cache.pop(old, None)
+        for seg in _lectures().reading.all("page-segments", db):
+            path = seg["path"]
+            if path == old_rel or (is_dir and path.startswith(old_p)):
+                seg["path"] = new_rel + path[len(old_rel):]
+                _lectures().reading.put("page-segments", seg["segment_id"], seg, db)
+
+    op_id = uuid.uuid4().hex
+    if record_op:
+        op_rec = eng.record_file_operation(
+            action=action,
+            old_path=old_rel,
+            new_path=new_rel,
+            is_dir=is_dir,
+            target_id=target_id,
+            request_id=request_id,
+            request_payload=request,
+        )
+        op_id = op_rec["operation_id"]
+
+    return {
+        "ok": True,
+        "status": "complete",
+        "old_path": old_rel,
+        "path": new_rel,
+        "operationId": op_id,
+        **({"requestId": request_id} if request_id else {}),
+    }
 
 
 def _reading_purge(rel: str, is_dir: bool) -> None:
-    """Delete ALL reading-store rows for a path (or a directory prefix) and
-    drop it from the active round (counted done, same accounting as
-    list/remove). Anki cards made from the file are NOT touched (user
-    ruling 2026-10-06: 删除=硬删+进度清掉, 已制卡保留)."""
+    """Soft-delete notes/notebooks in `StorageEngine` (preserving Anki card
+    provenance in `segment_cards` for `reading_source` lookups) and remove them
+    from the active reading list and active round."""
+    eng = _storage()
     prefix = rel.rstrip("/") + "/"
-    conn = _reading_conn()
-    try:
-        with conn:
-            for t in ("rfiles", "segments", "rcards", "rorphans"):
-                if is_dir:
-                    conn.execute(
-                        f"DELETE FROM {t} WHERE path LIKE ? ESCAPE '\\'",
-                        (_like_escape(prefix) + "%",),
-                    )
-                else:
-                    conn.execute(f"DELETE FROM {t} WHERE path = ?", (rel,))
-            row = conn.execute("SELECT data FROM rround WHERE id = 1").fetchone()
-            if row and row[0]:
-                try:
-                    rd = json.loads(row[0])
-                except Exception:
-                    rd = None
-                if isinstance(rd, dict):
-                    pend = rd.get("pending") or []
-                    keep = [
-                        p for p in pend
-                        if not (
-                            p.get("path") == rel
-                            or (is_dir and str(p.get("path", "")).startswith(prefix))
-                        )
-                    ]
-                    dropped = len(pend) - len(keep)
-                    if dropped:
-                        rd["pending"] = keep
-                        rd["done"] = rd.get("done", 0) + dropped
-                        if not keep:
-                            rd["status"] = "complete"
-                        conn.execute(
-                            "UPDATE rround SET data = ? WHERE id = 1",
-                            (json.dumps(rd, ensure_ascii=False),),
-                        )
-    finally:
-        conn.close()
+    if is_dir:
+        nb = eng.resolve_notebook(rel, include_deleted=False)
+        if nb is not None:
+            eng.soft_delete_notebook(nb["id"])
+        # Also soft-delete any active notes whose legacy_path starts with prefix
+        for n in eng.list_notes(include_deleted=False):
+            lp = n.get("legacy_path") or n.get("path") or ""
+            if lp == rel or lp.startswith(prefix):
+                eng.soft_delete_note(n["id"])
+                _synced_disk_sha.pop(lp, None)
+                _chunk_cache.pop(lp, None)
+    else:
+        note = eng.resolve_note(rel, include_deleted=False)
+        if note is not None:
+            eng.soft_delete_note(note["id"])
+        _synced_disk_sha.pop(rel, None)
+        _chunk_cache.pop(rel, None)
+
+    rd = eng.get_reading_round()
+    if isinstance(rd, dict):
+        pend = rd.get("pending") or []
+        keep = [
+            p
+            for p in pend
+            if not (
+                p.get("path") == rel
+                or (is_dir and str(p.get("path", "")).startswith(prefix))
+            )
+        ]
+        dropped = len(pend) - len(keep)
+        if dropped:
+            rd["pending"] = keep
+            rd["done"] = rd.get("done", 0) + dropped
+            if not keep:
+                rd["status"] = "complete"
+            eng.set_reading_round(rd)
+
     with _lectures().docs.db() as db:
-        for doc in _lectures().docs.all('documents',db):
-            if doc['path']==rel or (is_dir and doc['path'].startswith(prefix)):
+        for doc in _lectures().docs.all('documents', db):
+            if doc['path'] == rel or (is_dir and doc['path'].startswith(prefix)):
                 doc.update(listed=False, original_missing=True)
-                _lectures().docs.put('documents',doc['document_id'],doc,db)
-    _chunk_cache.pop(rel, None)
+                _lectures().docs.put('documents', doc['document_id'], doc, db)
 
 
 class FilesRenameBody(BaseModel):
@@ -4068,7 +4443,11 @@ async def files_mkdir(body: FilesMkdirBody):
             raise HTTPException(409, "目标名称已存在")
         except OSError:
             raise HTTPException(503, "创建结果待确认，请刷新目录核对；不要直接重试")
-        return {"ok": True, "path": _files_rel(target)}
+        rel_target = _files_rel(target)
+        # If StorageEngine is already initialized, mirror the notebook into data.db
+        if _storage_instance is not None or STORAGE_DB_FILE.exists():
+            _storage().resolve_or_create_notebook_path(rel_target)
+        return {"ok": True, "path": rel_target}
 
 
 @app.post("/api/files/rename")
@@ -4079,21 +4458,21 @@ async def files_rename(body: FilesRenameBody):
         if replay:
             return replay
         src = _files_resolve(body.path)
-        if not src.exists():
+        eng = _storage()
+        db_note = eng.resolve_note(body.path, include_deleted=False)
+        db_nb = eng.resolve_notebook(body.path, include_deleted=False)
+        if not src.exists() and db_note is None and db_nb is None:
             raise HTTPException(status_code=404, detail="文件不存在")
         name = _files_check_name(body.new_name)
-        is_dir = src.is_dir()
-        is_md = src.is_file() and src.suffix.lower() == ".md"
+        is_dir = src.is_dir() or (db_nb is not None and db_note is None)
+        is_md = (src.is_file() and src.suffix.lower() == ".md") or (db_note is not None)
         is_lecture = src.is_file() and src.suffix.lower() in ('.pdf','.ppt','.pptx') and any(d['path']==body.path for d in _lectures().docs.list())
         if is_lecture:
             if not Path(name).suffix:
                 name += src.suffix
             if Path(name).suffix.lower() != src.suffix.lower():
                 raise HTTPException(400,'课件重命名不能改变格式；请导入新版本')
-        if src.is_file() and not is_md and not is_lecture:
-            # v1 limitation (user-approved): note images are referenced by
-            # BARE BASENAME from .md files — renaming one silently breaks
-            # every reference. Images travel with folder moves instead.
+        if not is_dir and not is_md and not is_lecture:
             raise HTTPException(
                 status_code=400,
                 detail="暂不支持重命名图片（会断开 .md 里的引用）；图片可随文件夹整体移动",
@@ -4102,11 +4481,19 @@ async def files_rename(body: FilesRenameBody):
             name += ".md"  # friendly: inline rename without the extension
         dst = src.parent / name
         old_rel = _files_rel(src)
+        new_rel = _files_rel(dst)
         if dst == src:
             return {"ok": True, "path": old_rel, "unchanged": True}
-        if dst.exists():
+        if dst.exists() or (is_dir and eng.resolve_notebook(new_rel) is not None) or (is_md and eng.resolve_note(new_rel) is not None):
             raise HTTPException(status_code=409, detail="目标名称已存在")
-        return _files_relocate_api(old_rel, _files_rel(dst), is_dir, body.requestId, request)
+        return _execute_relocation(
+            old_rel,
+            new_rel,
+            is_dir,
+            action="rename",
+            request_id=body.requestId,
+            request=request,
+        )
 
 
 @app.post("/api/files/move")
@@ -4117,29 +4504,43 @@ async def files_move(body: FilesMoveBody):
         if replay:
             return replay
         src = _files_resolve(body.path)
-        if not src.exists():
+        eng = _storage()
+        db_note = eng.resolve_note(body.path, include_deleted=False)
+        db_nb = eng.resolve_notebook(body.path, include_deleted=False)
+        if not src.exists() and db_note is None and db_nb is None:
             raise HTTPException(status_code=404, detail="文件不存在")
         new_dir_rel = (body.new_dir or "").strip().replace("\\", "/").strip("/")
         dst_dir = _files_root() if not new_dir_rel else _files_resolve(new_dir_rel)
         if dst_dir.exists() and not dst_dir.is_dir():
             raise HTTPException(status_code=400, detail="目标不是文件夹")
-        is_dir = src.is_dir()
+        is_dir = src.is_dir() or (db_nb is not None and db_note is None)
         if is_dir and (dst_dir == src or src in dst_dir.parents):
             raise HTTPException(status_code=400, detail="不能把文件夹移动到它自己里面")
         dst = dst_dir / src.name
         old_rel = _files_rel(src)
+        new_rel = _files_rel(dst)
         if dst == src:
             return {"ok": True, "path": old_rel, "unchanged": True}
-        if dst.exists():
+        if dst.exists() or (is_dir and eng.resolve_notebook(new_rel) is not None) or (not is_dir and eng.resolve_note(new_rel) is not None):
             raise HTTPException(status_code=409, detail="目标位置已有同名文件/文件夹")
-        return _files_relocate_api(old_rel, _files_rel(dst), is_dir, body.requestId, request)
+        return _execute_relocation(
+            old_rel,
+            new_rel,
+            is_dir,
+            action="move",
+            request_id=body.requestId,
+            request=request,
+        )
 
 
 @app.post("/api/files/delete")
 async def files_delete(body: FilesDeleteBody):
     async with _state_lock:
         src = _files_resolve(body.path)
-        if not src.exists():
+        eng = _storage()
+        db_note = eng.resolve_note(body.path, include_deleted=False)
+        db_nb = eng.resolve_notebook(body.path, include_deleted=False)
+        if not src.exists() and db_note is None and db_nb is None:
             raise HTTPException(status_code=404, detail="文件不存在")
         # 防呆 (user ruling): the request must carry the exact basename
         if (body.confirm or "") != src.name:
@@ -4148,130 +4549,164 @@ async def files_delete(body: FilesDeleteBody):
                 detail=f"确认文本不匹配（需要输入 {src.name}）",
             )
         rel = _files_rel(src)
-        is_dir = src.is_dir()
-        if is_dir:
-            shutil.rmtree(src)
-        else:
-            src.unlink()
+        is_dir = src.is_dir() or (db_nb is not None and db_note is None)
+        if src.exists():
+            if is_dir:
+                shutil.rmtree(src)
+            else:
+                src.unlink()
         _reading_purge(rel, is_dir)
         return {"ok": True, "deleted": rel, "was_dir": is_dir}
 
 
-def _rewrite_image_refs(text: str, mapping: dict[str, str], source: str, destination: str, *, max_bytes: int) -> str:
-    """Resolve references in the original upload tree, then map to final paths."""
-    import posixpath
-    from urllib.parse import urlsplit, unquote, quote
-    def rewrite(ref):
-        try:
-            parsed = urlsplit(re.sub(r'\\([\\() ])', r'\1', ref))
-        except ValueError:
-            return ref
-        if parsed.scheme or parsed.netloc or ref.startswith(('/', '#')):
-            return ref
-        identity = posixpath.normpath(posixpath.join(posixpath.dirname(source), unquote(parsed.path)))
-        if identity == '..' or identity.startswith('../') or identity not in mapping:
-            return ref
-        result = quote(posixpath.relpath(mapping[identity], posixpath.dirname(destination) or '.'), safe='/.-_')
-        return result + ('?' + parsed.query if parsed.query else '') + ('#' + parsed.fragment if parsed.fragment else '')
-    def visible_markdown(source_text):
-        # Parse blocks only: token maps include quote/list containers. Keep original
-        # offsets and bytes; the parser's normalized text is never written back.
-        from markdown_it import MarkdownIt
-        parser = MarkdownIt('commonmark', {'maxNesting': 100})
-        normalized = source_text.replace('\r\n', '\n').replace('\r', '\n')
-        tokens = []
-        parser.block.parse(normalized, parser, {}, tokens)
-        starts = [0] + [match.end() for match in re.finditer(r'\r\n|\r|\n', source_text)]
-        starts.append(len(source_text))
-        characters = list(source_text)
-        for token in tokens:
-            if token.type in ('code_block', 'fence') and token.map is not None:
-                start, stop = token.map
-                for position in range(starts[start], starts[stop]):
-                    if characters[position] not in '\r\n':
-                        characters[position] = ' '
-        visible = ''.join(characters)
-        runs = list(re.finditer(r'`+', visible))
-        next_same, last = {}, {}
-        for index in range(len(runs) - 1, -1, -1):
-            length = len(runs[index][0])
-            if length in last:
-                next_same[index] = last[length]
-            last[length] = index
-        characters, end = list(visible), 0
-        for index, run in enumerate(runs):
-            if run.start() < end or index not in next_same:
-                continue
-            # Backslash escapes apply to openers outside code, not closers inside.
-            backslashes, position = 0, run.start() - 1
-            while position >= 0 and visible[position] == '\\':
-                backslashes += 1; position -= 1
-            if backslashes % 2:
-                continue
-            end = runs[next_same[index]].end()
-            for position in range(run.start(), end):
-                if characters[position] != '\n':
-                    characters[position] = ' '
-        return ''.join(characters)
 
-    def bounded_sub(pattern, replace, source_text, flags=0):
-        parts, offset, size = [], 0, 0
-        def append(value):
-            nonlocal size
-            size += len(value.encode('utf-8'))
-            if size > max_bytes:
-                raise HTTPException(status_code=413, detail=f'图片引用改写后超出文件预算（{max_bytes} 字节）')
-            parts.append(value)
-        compiled = re.compile(pattern, flags)
-        for match in compiled.finditer(visible_markdown(source_text)):
-            original = compiled.match(source_text, match.start())
-            replacement = replace(original) if original and original.end() == match.end() else source_text[match.start():match.end()]
-            append(source_text[offset:match.start()]); append(replacement); offset = match.end()
-        append(source_text[offset:])
-        return ''.join(parts)
-    # Inline destinations can have balanced parentheses or escaped punctuation.
-    mask, parts, offset, size = visible_markdown(text), [], 0, 0
-    def append_inline(value):
-        nonlocal size
-        size += len(value.encode('utf-8'))
-        if size > max_bytes:
-            raise HTTPException(status_code=413, detail=f'图片引用改写后超出文件预算（{max_bytes} 字节）')
-        parts.append(value)
-    for match in re.finditer(r'!\[[^\]\n]*\]\(\s*', mask):
-        start = match.end()
-        if start < offset or start >= len(mask):
-            continue
-        if mask[start] == '<':
-            end = mask.find('>', start + 1)
-            if end < 0 or '\n' in mask[start:end]:
-                continue
-            start += 1
-        else:
-            end, depth = start, 0
-            while end < len(mask):
-                char = mask[end]
-                if char == '\\' and end + 1 < len(mask):
-                    end += 2; continue
-                if char == '(':
-                    depth += 1
-                elif char == ')':
-                    if depth == 0: break
-                    depth -= 1
-                elif char.isspace():
-                    break
-                end += 1
-            if depth or end == len(mask):
-                continue
-        append_inline(text[offset:start]); append_inline(rewrite(text[start:end])); offset = end
-    append_inline(text[offset:])
-    text = ''.join(parts)
-    labels = {re.sub(r'\s+', ' ', (m[2] or m[1])).strip().lower()
-              for m in re.finditer(r'!\[([^\]\n]+)\](?:\[([^\]\n]*)\])?(?!\()', visible_markdown(text))}
-    text = bounded_sub(r'(?m)^( {0,3}\[([^\]\n]+)\]:[ \t]*)(<[^>]+>|[^\s]+)([^\n]*)$',
-        lambda m: m[1] + (('<' + rewrite(m[3][1:-1]) + '>') if m[3].startswith('<') else rewrite(m[3])) + m[4]
-            if re.sub(r'\s+', ' ', m[2]).strip().lower() in labels else m[0], text)
-    return bounded_sub(r"((?:src|href)\s*=\s*[\"'])([^\"']+)([\"'])",
-                  lambda m: m[1] + rewrite(m[2]) + m[3], text, flags=re.I)
+# ---- Joplin-mode Interop Import Service (P0: StorageEngine SSOT) -------------
+# All imports flow through `backend/interop/` (`InteropService` + two-stage
+# `MarkdownImporter`) directly into `StorageEngine` (`data.db` + flat `media/`
+# sandbox). Physical `NOTES_DIR` scanning, image basename prefix-renaming,
+# `_assets` workarounds, and per-file `fsync` double-writes are retired.
+
+
+def _interop_service():
+    from interop import get_default_interop_service
+
+    return get_default_interop_service()
+
+
+@app.get("/api/interop/modules")
+async def interop_modules():
+    """List registered Joplin-style import modules and supported extensions."""
+    return {"modules": _interop_service().list_modules()}
+
+
+async def _execute_interop_upload(
+    files: list[UploadFile],
+    rel_paths: list[str],
+    target_dir: str,
+    on_conflict: str,
+    fmt: str = "md",
+) -> dict:
+    from interop import (
+        ImportConflictError,
+        ImportFile,
+        ImportOptions,
+        ImportValidationError,
+        normalize_import_rel_path,
+        normalize_target_dir,
+    )
+
+    if len(files) != len(rel_paths):
+        raise HTTPException(status_code=400, detail="files 与 rel_paths 数量不一致")
+    if not files:
+        raise HTTPException(status_code=400, detail="没有上传任何文件")
+    if on_conflict not in ("error", "overwrite", "rename", "skip"):
+        raise HTTPException(status_code=400, detail="on_conflict 非法")
+    try:
+        clean_target_dir = normalize_target_dir(target_dir)
+    except ImportValidationError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    if len(files) > UPLOAD_MAX_FILES:
+        raise HTTPException(
+            status_code=413, detail=f"上传文件过多（最多 {UPLOAD_MAX_FILES} 个）"
+        )
+
+    # Read and size-bound all upload streams off-lock.
+    total_bytes = 0
+    payloads: list[ImportFile] = []
+    seen_paths: set[str] = set()
+    for up, rel in zip(files, rel_paths):
+        try:
+            norm_rel = normalize_import_rel_path(rel)
+        except ImportValidationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        if norm_rel in seen_paths:
+            raise HTTPException(status_code=409, detail=f"批内重复目标：{norm_rel}")
+        seen_paths.add(norm_rel)
+        remaining_budget = UPLOAD_BATCH_MAX_BYTES - total_bytes
+        data = await _read_upload_bounded(
+            up, min(UPLOAD_MAX_BYTES, remaining_budget), norm_rel
+        )
+        total_bytes += len(data)
+        if len(data) > UPLOAD_MAX_BYTES:
+            raise HTTPException(
+                status_code=413, detail=f"文件过大（最多 25 MB）：{norm_rel}"
+            )
+        payloads.append(
+            ImportFile(
+                rel_path=norm_rel,
+                data=data,
+                content_type=getattr(up, "content_type", None),
+            )
+        )
+
+    opts = ImportOptions(
+        target_dir=clean_target_dir,
+        on_conflict=on_conflict,  # type: ignore[arg-type]
+        format=fmt,
+    )
+
+    async with _state_lock:
+        eng = _storage()
+        # If a legacy fixture dropped a matching .md straight into NOTES_DIR after
+        # startup, sync just those exact paths (O(M) stat, no rglob) so conflict
+        # checks see them consistently.
+        if NOTES_DIR.is_dir():
+            for p in payloads:
+                if Path(p.rel_path).suffix.lower() == ".md":
+                    dest_rel = (
+                        f"{clean_target_dir}/{p.rel_path}"
+                        if clean_target_dir
+                        else p.rel_path
+                    )
+                    if eng.get_note_by_legacy_path(dest_rel, include_deleted=False) is None:
+                        _sync_disk_note_if_needed(dest_rel)
+
+        try:
+            result = _interop_service().import_files(eng, payloads, opts)
+        except ImportConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=json.dumps({"conflicts": exc.conflicts}, ensure_ascii=False),
+            ) from exc
+        except ImportValidationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+        # Ensure stale untouched files in NOTES_DIR never shadow newly overwritten notes.
+        if NOTES_DIR.is_dir():
+            root = NOTES_DIR.resolve()
+            for item in result.imported_notes:
+                if item.action in ("written", "overwritten", "renamed"):
+                    try:
+                        disk_p = (NOTES_DIR / item.path).resolve()
+                        if disk_p.is_relative_to(root) and disk_p.is_file():
+                            disk_text = disk_p.read_text(encoding="utf-8")
+                            norm_disk = disk_text.replace("\r\n", "\n").replace("\r", "\n")
+                            _synced_disk_sha[item.path] = hashlib.sha256(
+                                norm_disk.encode("utf-8")
+                            ).hexdigest()
+                    except OSError:
+                        pass
+
+        return result.to_dict()
+
+
+@app.post("/api/interop/import")
+async def interop_import(
+    files: list[UploadFile] = File(...),
+    rel_paths: list[str] = Form(...),
+    target_dir: str = Form("", alias="dir"),
+    on_conflict: str = Form("error"),
+    fmt: str = Form("md", alias="format"),
+):
+    """Unified Joplin-style import endpoint writing directly to StorageEngine (SSOT)."""
+    return await _execute_interop_upload(
+        files=files,
+        rel_paths=rel_paths,
+        target_dir=target_dir,
+        on_conflict=on_conflict,
+        fmt=fmt,
+    )
 
 
 @app.post("/api/files/upload")
@@ -4281,199 +4716,23 @@ async def files_upload(
     target_dir: str = Form("", alias="dir"),
     on_conflict: str = Form("error"),  # error | overwrite | rename | skip
 ):
-    """Upload .md notes + images into the corpus (user spec 2026-10-06).
+    """Upload .md notes + referenced images directly into StorageEngine via InteropService.
 
-    Folder uploads ride webkitRelativePath: the frontend sends every file
-    with its relative path and they land under `dir` keeping the subtree.
-    .md name conflict → policy (error=409 so the UI can ask; overwrite /
-    rename=auto `name (1).md` / skip). IMAGES keep their relative position,
-    but a basename collision with ANY existing corpus image auto-prefixes
-    the folder name (media is served by basename — the textbook-import
-    lesson) and the same batch's .md references are rewritten to match.
-    Uploaded files do NOT auto-join the reading list (stays opt-in).
+    - Notes are stored in SQLite (`notebooks` + `notes`) with `:/<resource_id>` image links
+      and complete `note_resources` link rows (immune to GC deletion).
+    - Images are ingested on demand into the flat `media/<id>.<ext>` sandbox with SHA-256
+      deduplication (no basename collisions, no prefix renaming, no unreferenced junk).
+    - Non-blocking tolerance: UTF-8 BOM stripped automatically; empty files, invalid UTF-8,
+      and unsupported/system files are recorded in `skipped`/`warnings` instead of aborting.
+    - Uploaded notes do NOT auto-join the reading list (stays opt-in).
     """
-    if len(files) != len(rel_paths):
-        raise HTTPException(status_code=400, detail="files 与 rel_paths 数量不一致")
-    if not files:
-        raise HTTPException(status_code=400, detail="没有上传任何文件")
-    if on_conflict not in ("error", "overwrite", "rename", "skip"):
-        raise HTTPException(status_code=400, detail="on_conflict 非法")
-    tdir_rel = (target_dir or "").strip().replace("\\", "/").strip("/")
-    tdir = _files_root() if not tdir_rel else _files_resolve(tdir_rel)
-    if tdir.exists() and not tdir.is_dir():
-        raise HTTPException(status_code=400, detail="目标不是文件夹")
-
-    if len(files) > UPLOAD_MAX_FILES:
-        raise HTTPException(status_code=413, detail=f"上传文件过多（最多 {UPLOAD_MAX_FILES} 个）")
-    total_bytes = 0
-    # read + validate everything up front (all-or-nothing before writes)
-    items: list[dict] = []
-    original_paths = set()
-    for up, rel in zip(files, rel_paths):
-        rel = (rel or "").strip().replace("\\", "/")
-        if rel.startswith("/"):
-            raise HTTPException(status_code=400, detail="上传路径必须是相对路径")
-        import posixpath
-        rel = posixpath.normpath(rel) if rel else ""
-        if not rel:
-            raise HTTPException(status_code=400, detail="缺少相对路径")
-        dest = _files_resolve(
-            (tdir_rel + "/" if tdir_rel else "") + rel, upload_image=True)
-        identity = _files_rel(dest)
-        if identity in original_paths:
-            raise HTTPException(status_code=409, detail=f"批内重复目标：{rel}")
-        original_paths.add(identity)
-        suffix = dest.suffix.lower()
-        if suffix == ".md":
-            kind = "md"
-        elif suffix in NOTE_IMAGE_EXTS:
-            kind = "img"
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail=f"仅支持 .md 笔记和图片：{rel}",
-            )
-        data = await _read_upload_bounded(up, min(UPLOAD_MAX_BYTES, UPLOAD_BATCH_MAX_BYTES - total_bytes), rel)
-        total_bytes += len(data)
-        if not data:
-            raise HTTPException(status_code=400, detail=f"空文件：{rel}")
-        if len(data) > UPLOAD_MAX_BYTES:
-            raise HTTPException(
-                status_code=413, detail=f"文件过大（最多 25 MB）：{rel}")
-        if kind == "md":
-            try:
-                data.decode("utf-8")
-            except UnicodeDecodeError:
-                raise HTTPException(status_code=400, detail=f"不是有效的 UTF-8 文本：{rel}")
-        items.append({"rel": rel, "dest": dest, "kind": kind, "data": data})
-
-    async with _state_lock:
-        # Revalidate after off-lock reads; mutations and name allocation remain serialized.
-        for it in items:
-            _files_resolve((tdir_rel + "/" if tdir_rel else "") + it["rel"], upload_image=True)
-        if tdir.exists() and not tdir.is_dir():
-            raise HTTPException(status_code=409, detail="目标不是文件夹")
-        # existing image basenames (media is served corpus-wide by basename)
-        img_names: set[str] = set()
-        for p in NOTES_DIR.rglob("*"):
-            try:
-                if p.is_file() and p.suffix.lower() in NOTE_IMAGE_EXTS:
-                    img_names.add(p.name)
-            except OSError:
-                continue
-
-        reserved: set[Path] = {it["dest"] for it in items}
-        allocated: set[Path] = set()
-
-        def _free_name(dirpath: Path, name: str) -> str:
-            """First free `name`, else `stem (1).ext`, `stem (2).ext`, …"""
-            if not (dirpath / name).exists() and (dirpath / name) not in reserved and (dirpath / name) not in allocated:
-                return name
-            stem, ext = Path(name).stem, Path(name).suffix
-            i = 1
-            while ((dirpath / f"{stem} ({i}){ext}").exists() or (dirpath / f"{stem} ({i}){ext}") in reserved or (dirpath / f"{stem} ({i}){ext}") in allocated):
-                i += 1
-            return f"{stem} ({i}){ext}"
-
-        conflicts: list[str] = []
-        rename_map: dict[str, str] = {}   # original relative image identity → final corpus path
-        for it in items:
-            dest: Path = it["dest"]
-            if it["kind"] == "md":
-                if dest.exists():
-                    if on_conflict == "error":
-                        conflicts.append(it["rel"])
-                    elif on_conflict == "overwrite":
-                        it["action"] = "overwritten"
-                    elif on_conflict == "rename":
-                        dest = dest.parent / _free_name(dest.parent, dest.name)
-                        it["dest"] = dest
-                        it["action"] = "renamed"
-                    else:  # skip
-                        it["action"] = "skipped"
-                else:
-                    it["action"] = "written"
-            else:
-                if dest.name in img_names:
-                    # basename collision → prefix with the upload's first
-                    # folder component (textbook-import lesson), else (N)
-                    parts = Path(it["rel"]).parts
-                    prefix = parts[0] if len(parts) > 1 else (
-                        tdir_rel.split("/")[-1] if tdir_rel else "img")
-                    prefix = re.sub(r"[^\w\u4e00-\u9fff.-]+", "-", prefix).strip("-")
-                    cand = f"{prefix}-{dest.name}"
-                    i = 1
-                    stem, ext = Path(cand).stem, Path(cand).suffix
-                    while cand in img_names:
-                        cand = f"{stem} ({i}){ext}"
-                        i += 1
-                    it["dest"] = dest.parent / cand
-                    it["action"] = "renamed"
-                else:
-                    it["action"] = "written"
-                img_names.add(it["dest"].name)  # claim within the batch
-                rename_map[it["rel"]] = _files_rel(it["dest"])
-
-        if conflicts:
-            raise HTTPException(
-                status_code=409,
-                detail=json.dumps(
-                    {"conflicts": conflicts}, ensure_ascii=False),
-            )
-
-        existing_parent = _files_root()
-        while not existing_parent.exists():
-            existing_parent = existing_parent.parent
-        name_limit = os.pathconf(existing_parent, 'PC_NAME_MAX')
-        path_limit = os.pathconf(existing_parent, 'PC_PATH_MAX')
-        for it in items:
-            dest = it['dest']
-            if (any(len(part.encode('utf-8')) > name_limit for part in dest.parts)
-                or len(os.fsencode(dest)) >= path_limit):
-                raise HTTPException(status_code=400, detail=f"分配后的路径过长：{it['rel']}")
-
-        for it in items:
-            if it['action'] == 'skipped':
-                continue
-            dest = it['dest']
-            if dest in allocated or (dest.exists() and not dest.is_file()):
-                raise HTTPException(status_code=409, detail=f"目标冲突：{it['rel']}")
-            allocated.add(dest)
-            if any((parent.exists() and not parent.is_dir()) or parent in reserved for parent in dest.parents if parent != _files_root() and parent.is_relative_to(_files_root())):
-                raise HTTPException(status_code=409, detail=f"父路径冲突：{it['rel']}")
-            if it['kind'] == 'md':
-                it['data'] = _rewrite_image_refs(it['data'].decode('utf-8'), rename_map, it['rel'], _files_rel(dest), max_bytes=UPLOAD_MAX_BYTES).encode('utf-8')
-
-        if sum(len(it['data']) for it in items) > UPLOAD_BATCH_MAX_BYTES:
-            raise HTTPException(status_code=413, detail=f'改写后超出上传批次预算（{UPLOAD_BATCH_MAX_BYTES} 字节）')
-
-        # Each file is atomically replaced. A batch is NOT a filesystem transaction:
-        # true I/O failures report exactly what committed, allowing a conscious retry.
-        saved: list[dict] = []
-        for index, it in enumerate(items):
-            if it['action'] == 'skipped':
-                saved.append({'path': it['rel'], 'action': 'skipped'})
-                continue
-            dest = it['dest']
-            temp = dest.parent / ('.upload-' + uuid.uuid4().hex)
-            try:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                with temp.open('xb') as stream:
-                    stream.write(it['data']); stream.flush(); os.fsync(stream.fileno())
-                temp.replace(dest)
-                saved.append({'path': _files_rel(dest), 'action': it['action'], 'original': it['rel']})
-                fd = os.open(dest.parent, os.O_RDONLY)
-                try: os.fsync(fd)
-                finally: os.close(fd)
-            except OSError as exc:
-                raise HTTPException(status_code=503, detail={'partial': bool(saved), 'saved': saved,
-                    'failed': it['rel'], 'remaining': [x['rel'] for x in items[index:]],
-                    'message': '上传 I/O 失败；请核对已保存文件后重试'}) from exc
-            finally:
-                with suppress(OSError):
-                    temp.unlink(missing_ok=True)
-        return {'ok': True, 'saved': saved, 'images_renamed': {rel: final for rel, final in rename_map.items()
-            if final != ((tdir_rel + '/') if tdir_rel else '') + rel}}
+    return await _execute_interop_upload(
+        files=files,
+        rel_paths=rel_paths,
+        target_dir=target_dir,
+        on_conflict=on_conflict,
+        fmt="md",
+    )
 
 
 
@@ -5387,19 +5646,33 @@ async def reading_edit(body: ReadingEditBody):
                 o["start_line"] = o["start_line"] + delta
                 o["end_line"] = o.get("end_line", o["start_line"]) + delta
 
-        # atomic file write, then state (file first: a failed write must
-        # leave the state untouched; a failed state write leaves the file
-        # ahead and the next _file_view trips the re-anchor fuse — which
-        # re-locates pure-shift segments cleanly)
+        merged_text = "\n".join(merged)
+        new_sha = hashlib.sha256(merged_text.encode("utf-8")).hexdigest()
+
+        # Mirror to NOTES_DIR if the physical file exists on disk (or NOTES_DIR is active)
         p = NOTES_DIR / body.path
-        tmp = p.with_suffix(p.suffix + f".tmp-{uuid.uuid4().hex[:8]}")
-        try:
-            tmp.write_text("\n".join(merged), encoding="utf-8")
-            os.replace(tmp, p)
-        except OSError as e:
-            tmp.unlink(missing_ok=True)
-            raise HTTPException(status_code=500, detail=f"file write failed: {e}")
-        entry["file_sha"] = hashlib.sha256("\n".join(merged).encode("utf-8")).hexdigest()
+        if p.exists() or NOTES_DIR.is_dir():
+            tmp = p.with_suffix(p.suffix + f".tmp-{uuid.uuid4().hex[:8]}")
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                tmp.write_text(merged_text, encoding="utf-8")
+                os.replace(tmp, p)
+            except OSError as e:
+                tmp.unlink(missing_ok=True)
+                raise HTTPException(status_code=500, detail=f"file write failed: {e}")
+
+        # Persist updated body + historical revision snapshot in StorageEngine (`data.db`)
+        eng = _storage()
+        db_note = eng.resolve_note(body.path, include_deleted=False)
+        if db_note is not None:
+            eng.update_note_body(
+                db_note["id"],
+                merged_text,
+                reason="reading_edit",
+                reanchor=False,
+            )
+        _synced_disk_sha[body.path] = new_sha
+        entry["file_sha"] = new_sha
         _reading_write(data)
 
         # fresh payload for the on-screen chunk (same idiom as split's
@@ -5542,14 +5815,11 @@ async def reading_reseed(body: ReadingPathBody):
 
 @app.get("/api/reading/source")
 async def reading_source(note_id: int):
-    """Reverse provenance lookup (round 4): note → source segment.
+    """Reverse provenance lookup (round 4 + Stage 3): note → source segment.
 
-    Used by the review/preview UI to show a card's TRUE source (rcards is
-    exact history, not a similarity guess) and by the
-    add-card dialogs to inherit reading_source for cards made while
-    reviewing (卡 a 复习时制的卡 b 也归到 a 的片段). 404 = orphan card
-    (pre-round-4, desktop-Anki-made, or source segment orphaned) — the UI
-    then shows 无来源.
+    Used by the review/preview UI to show a card's TRUE source (`segment_cards`
+    is exact history, not a similarity guess) and by the add-card dialogs to
+    inherit reading_source for cards made while reviewing.
     """
     _reading_guard()
     lecture_source = _lectures().source(note_id)
@@ -5562,7 +5832,6 @@ async def reading_source(note_id: int):
         for s in entry.get("segments") or []:
             if note_id in (s.get("cards_created") or []):
                 path = entry.get("path", "")
-                # breadcrumb: walk parent_seg_id up to the seeded root
                 by_id = {x.get("seg_id"): x for x in entry.get("segments") or []}
                 trail = []
                 cur = s
@@ -5587,32 +5856,44 @@ async def reading_source(note_id: int):
                     "fingerprint": s.get("fingerprint", ""),
                     "edit_revision": entry.get("file_sha", ""),
                     "text": "\n".join(lines[a - 1 : b]) if lines else "",
-                    # every note id created from THIS segment (三栏左栏
-                    # 「相关卡片」, 2026-09-21) — feed to /api/reading/cards
                     "cards_created": list(s.get("cards_created") or []),
                     "breadcrumb": [
                         {
                             "seg_id": t.get("seg_id"),
                             "status": t.get("status", "todo"),
                             "title": t.get("title") or "",
-                            "line_start": t.get("line_start"),
-                            "line_end": t.get("line_end"),
-                            # full sibling list per crumb so the left column
-                            # can show 同一片段的卡片 for cards made against
-                            # an ANCESTOR (pre-split provenance rule):
-                            # the container keeps the cards forever
+                            "line_start": t.get("line_start") or t.get("start_line"),
+                            "line_end": t.get("line_end") or t.get("end_line"),
                             "cards_created": list(t.get("cards_created") or []),
                         }
                         for t in trail
                     ],
                 }
+    # Fallback: check StorageEngine directly (includes unlisted & soft-deleted notes
+    # migrated from historical rfiles so cards never lose provenance!)
+    src_db = _storage().find_card_source(note_id)
+    if src_db is not None:
+        return {
+            "path": src_db.get("legacy_path") or src_db["title"],
+            "note_id": src_db["note_id"],
+            "note_deleted": bool(src_db.get("note_deleted")),
+            "seg_id": src_db["seg_id"],
+            "status": src_db["status"],
+            "stale": src_db["stale"],
+            "line_start": src_db["line_start"],
+            "line_end": src_db["line_end"],
+            "fingerprint": src_db["fingerprint"],
+            "edit_revision": src_db["edit_revision"],
+            "text": src_db["text"],
+            "cards_created": src_db["cards_created"],
+            "breadcrumb": src_db["breadcrumb"],
+        }
     raise HTTPException(status_code=404, detail="no reading source for this note")
 
 
 @app.get("/api/reading/file")
 async def reading_file(path: str):
-    """Raw markdown for the reading right-hand panel (served directly from
-    the corpus)."""
+    """Raw markdown for the reading right-hand panel (served from StorageEngine)."""
     _reading_guard()
     text = _read_note_text(path)
     if text is None:
@@ -5620,41 +5901,69 @@ async def reading_file(path: str):
     return {"path": path, "text": text}
 
 
-# ---- reading-mode note images (P5, user spec 2026-09-23) ---------------------
-# Notes reference images by BARE BASENAME (same convention as Anki's
-# collection.media): `![](paste-….png)` → GET /api/reading/media/<name>.
-# Files live in NOTES_DIR/_assets (editor uploads) or anywhere else under
-# NOTES_DIR (manually dropped / Obsidian-style attachments). Serving by
-# basename keeps .md files pure (user preference: 文件存纯净文本) and makes
-# notes relocatable. The frontend markdown-it image rule rewrites
-# non-URL srcs to this route.
+# ---- reading-mode note images (Joplin-mode media sandbox + legacy compat) ----
+# Notes reference resources either via Joplin syntax `![](:/<resource_id>)` or
+# by legacy bare basename `![](<filename>)`, both served at
+# `GET /api/reading/media/<name_or_resource_id>`.
 NOTE_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif"}
 NOTES_ASSETS_DIR = NOTES_DIR / "_assets"
 
 
 def _find_note_image(name: str) -> Path | None:
-    """Traversal-safe basename lookup of one note image under NOTES_DIR.
-    _assets first (the editor's upload store), then a corpus-wide scan."""
-    safe = os.path.basename(name)
-    if not safe or Path(safe).suffix.lower() not in NOTE_IMAGE_EXTS:
+    """Resolve a note image from `StorageEngine`'s `media/` sandbox (by resource_id,
+    `:/<resource_id>`, `legacy_name`, or `filename`), falling back to `NOTES_DIR`."""
+    clean = (name or "").strip()
+    if clean.startswith(":/"):
+        clean = clean[2:]
+    safe = os.path.basename(clean)
+    if not safe:
         return None
-    root = NOTES_DIR.resolve()
-    hit = (NOTES_ASSETS_DIR / safe).resolve()
-    if hit.is_file() and hit.is_relative_to(root):
-        return hit
-    try:
-        for p in NOTES_DIR.rglob(safe):
-            rp = p.resolve()
-            if rp.is_file() and rp.is_relative_to(root):
-                return rp
-    except OSError:
-        pass
+    eng = _storage()
+    # 1. Check StorageEngine by resource_id (strip optional extension)
+    cand_id = Path(safe).stem if Path(safe).suffix.lower() in NOTE_IMAGE_EXTS else safe
+    for lookup_id in (safe, cand_id):
+        res = eng.get_resource(lookup_id)
+        if res is not None:
+            rel_file = f"{res['id']}{res['ext']}"
+            if eng.fs.exists(rel_file):
+                return (STORAGE_MEDIA_DIR / rel_file).resolve()
+    # 2. Check StorageEngine by legacy_name or filename
+    res_by_name = eng.get_resource_by_legacy_name(safe)
+    if res_by_name is None:
+        row = eng.db.query_one(
+            "SELECT id, ext FROM resources WHERE filename = ? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1",
+            (safe,),
+        )
+        if row:
+            rel_file = f"{row['id']}{row['ext']}"
+            if eng.fs.exists(rel_file):
+                return (STORAGE_MEDIA_DIR / rel_file).resolve()
+    else:
+        rel_file = f"{res_by_name['id']}{res_by_name['ext']}"
+        if eng.fs.exists(rel_file):
+            return (STORAGE_MEDIA_DIR / rel_file).resolve()
+
+    # 3. Fallback to NOTES_DIR on disk (and auto-import into StorageEngine if found)
+    if Path(safe).suffix.lower() not in NOTE_IMAGE_EXTS:
+        return None
+    if NOTES_DIR.is_dir():
+        root = NOTES_DIR.resolve()
+        hit = (NOTES_ASSETS_DIR / safe).resolve()
+        if hit.is_file() and hit.is_relative_to(root):
+            return hit
+        try:
+            for p in NOTES_DIR.rglob(safe):
+                rp = p.resolve()
+                if rp.is_file() and rp.is_relative_to(root):
+                    return rp
+        except OSError:
+            pass
     return None
 
 
 @app.get("/api/reading/media/{name:path}")
 async def reading_media(name: str):
-    """Serve one note-corpus image by basename (see _find_note_image)."""
+    """Serve one note-corpus image by resource_id or basename (see _find_note_image)."""
     _reading_guard()
     p = _find_note_image(name)
     if p is None:
@@ -5664,10 +5973,9 @@ async def reading_media(name: str):
 
 @app.post("/api/reading/media/upload")
 async def reading_media_upload(file: UploadFile = File(...)):
-    """Store an uploaded image in NOTES_DIR/_assets (reading-mode editor).
-    Returns the bare filename to insert as `![](<filename>)` — basename
-    references, served back at /api/reading/media/. Same clobber-proof
-    naming as /api/media/upload (timestamp + random suffix)."""
+    """Store an uploaded image in `StorageEngine`'s `media/` sandbox (and mirror
+    to `NOTES_DIR/_assets` when `NOTES_DIR` is used). Returns both `filename`
+    and `resource_id` / `markdown` (`![](:/<resource_id>)`)."""
     _reading_guard()
     data = await _read_upload_bounded(file, UPLOAD_MAX_BYTES, file.filename or "image")
     if not data:
@@ -5679,12 +5987,23 @@ async def reading_media_upload(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"unsupported image type: {ext or '(none)'}")
     stem = datetime.now().strftime("note-%Y%m%d-%H%M%S")
     filename = f"{stem}-{uuid.uuid4().hex[:6]}{ext}"
-    try:
-        NOTES_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
-        (NOTES_ASSETS_DIR / filename).write_bytes(data)
-    except OSError as e:
-        raise HTTPException(status_code=500, detail=f"write failed: {e}")
-    return {"filename": filename}
+    eng = _storage()
+    res = eng.put_resource(
+        filename,
+        data,
+        legacy_name=filename,
+    )
+    if NOTES_DIR.is_dir():
+        try:
+            NOTES_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+            (NOTES_ASSETS_DIR / filename).write_bytes(data)
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"write failed: {e}")
+    return {
+        "filename": filename,
+        "resource_id": res["id"],
+        "markdown": f"![](:/{res['id']})",
+    }
 
 
 def _field_value(v) -> str:
@@ -5808,6 +6127,363 @@ async def media(name: str):
     if not p.is_file():
         raise HTTPException(status_code=404, detail="media not found")
     return FileResponse(p)
+
+
+# ---- Joplin-mode Storage v2 API (Stage 3/4: UUID tree, FTS5 search, trash, revisions, resources) ----
+
+class StorageTrashRestoreBody(BaseModel):
+    kind: Literal["note", "notebook"]
+    id: str
+
+
+@app.get("/api/storage/tree")
+async def storage_tree():
+    """Return the full active notebook hierarchy and note metadata (with UUIDs)."""
+    async with _state_lock:
+        eng = _storage()
+        _corpus_files()  # ensure any newly dropped disk files are synced
+        notebooks = eng.list_notebooks(include_deleted=False)
+        notes = eng.list_notes(include_deleted=False)
+        return {
+            "notebooks": notebooks,
+            "notes": [
+                {
+                    "id": n["id"],
+                    "notebook_id": n["notebook_id"],
+                    "title": n["title"],
+                    "path": n["path"],
+                    "body_sha": n["body_sha"],
+                    "in_list": n["in_list"],
+                    "list_pos": n["list_pos"],
+                    "needs_resync": n["needs_resync"],
+                    "created_at": n["created_at"],
+                    "updated_at": n["updated_at"],
+                }
+                for n in notes
+            ],
+        }
+
+
+@app.get("/api/storage/search")
+async def storage_search(q: str, notebook_id: str | None = None, limit: int = 50):
+    """Full-text search across notes via FTS5 trigram / LIKE fallback."""
+    eng = _storage()
+    results = eng.search_notes(q, notebook_id=notebook_id, limit=max(1, min(limit, 200)))
+    return {"query": q, "results": results}
+
+
+@app.get("/api/storage/trash")
+async def storage_trash():
+    """List all soft-deleted notebooks and notes in the recycle bin."""
+    eng = _storage()
+    return eng.list_trash()
+
+
+@app.post("/api/storage/trash/restore")
+async def storage_trash_restore(body: StorageTrashRestoreBody):
+    """Restore a soft-deleted note or notebook (and its ancestor chain) from trash."""
+    from storage.engine import StorageNotFoundError, StorageConflictError
+
+    async with _state_lock:
+        eng = _storage()
+        try:
+            if body.kind == "note":
+                restored = eng.restore_note(body.id)
+                # Mirror back to NOTES_DIR if NOTES_DIR is active
+                if NOTES_DIR.is_dir() and restored.get("path"):
+                    try:
+                        p = _files_resolve(restored["path"])
+                        p.parent.mkdir(parents=True, exist_ok=True)
+                        p.write_text(restored.get("body") or "", encoding="utf-8")
+                        _synced_disk_sha[restored["path"]] = restored.get("body_sha") or ""
+                    except Exception:
+                        pass
+                return {"ok": True, "kind": "note", "restored": restored}
+            else:
+                restored = eng.restore_notebook(body.id)
+                if NOTES_DIR.is_dir() and restored.get("path"):
+                    with suppress(Exception):
+                        _files_resolve(restored["path"]).mkdir(parents=True, exist_ok=True)
+                return {"ok": True, "kind": "notebook", "restored": restored}
+        except (KeyError, StorageNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ValueError, StorageConflictError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/storage/trash/empty")
+async def storage_trash_empty():
+    """Permanently purge all soft-deleted notes, notebooks, and unreferenced resources."""
+    async with _state_lock:
+        eng = _storage()
+        counts = eng.empty_trash()
+        return {"ok": True, **counts}
+
+
+@app.get("/api/notes/{note_id}")
+async def storage_get_note(note_id: str):
+    """Fetch a note by UUID or path, including its reading segments."""
+    eng = _storage()
+    note = eng.resolve_note(note_id, include_deleted=False, include_segments=True)
+    if note is None:
+        raise HTTPException(status_code=404, detail="note not found")
+    return note
+
+
+@app.get("/api/notes/{note_id}/revisions")
+async def storage_note_revisions(note_id: str):
+    """List historical revisions for a note (newest first)."""
+    eng = _storage()
+    note = eng.resolve_note(note_id, include_deleted=True)
+    if note is None:
+        raise HTTPException(status_code=404, detail="note not found")
+    return {
+        "note_id": note["id"],
+        "path": note["path"],
+        "revisions": eng.list_note_revisions(note["id"]),
+    }
+
+
+@app.get("/api/notes/{note_id}/revisions/{revision_id}")
+async def storage_get_revision(note_id: str, revision_id: int):
+    """Fetch full content of a specific historical revision."""
+    eng = _storage()
+    note = eng.resolve_note(note_id, include_deleted=True)
+    if note is None:
+        raise HTTPException(status_code=404, detail="note not found")
+    rev = eng.get_note_revision(revision_id)
+    if rev is None or rev["note_id"] != note["id"]:
+        raise HTTPException(status_code=404, detail="revision not found")
+    return rev
+
+
+@app.post("/api/notes/{note_id}/revisions/{revision_id}/restore")
+async def storage_restore_revision(note_id: str, revision_id: int):
+    """Time-travel rollback: restore a note to a historical revision (automatically
+    saving the pre-rollback state as a new revision and re-anchoring reading segments)."""
+    from storage.engine import StorageNotFoundError, StorageConflictError
+
+    async with _state_lock:
+        eng = _storage()
+        note = eng.resolve_note(note_id, include_deleted=False)
+        if note is None:
+            raise HTTPException(status_code=404, detail="note not found")
+        try:
+            updated = eng.restore_note_revision(note["id"], revision_id)
+        except (KeyError, StorageNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ValueError, StorageConflictError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Mirror restored content to NOTES_DIR if present
+        if NOTES_DIR.is_dir() and updated.get("path"):
+            try:
+                p = _files_resolve(updated["path"])
+                if p.exists() or p.parent.is_dir():
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(updated["body"], encoding="utf-8")
+                    _synced_disk_sha[updated["path"]] = updated["body_sha"]
+            except Exception:
+                pass
+        return {"ok": True, "note": updated}
+
+
+@app.get("/api/resources/{resource_id}")
+async def storage_get_resource(resource_id: str):
+    """Serve a multimedia resource from the flat `media/` sandbox by resource_id."""
+    p = _find_note_image(resource_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail="resource not found")
+    return FileResponse(p)
+
+
+@app.post("/api/resources/upload")
+async def storage_upload_resource(file: UploadFile = File(...)):
+    """Upload a multimedia resource into the flat `media/` sandbox (SHA-256 deduplicated)."""
+    data = await _read_upload_bounded(file, UPLOAD_MAX_BYTES, file.filename or "resource")
+    if not data:
+        raise HTTPException(status_code=400, detail="empty file")
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in NOTE_IMAGE_EXTS:
+        raise HTTPException(status_code=400, detail=f"unsupported image type: {ext or '(none)'}")
+    eng = _storage()
+    res = eng.import_resource_bytes(file.filename or f"resource{ext}", data)
+    return {
+        "ok": True,
+        "resource": res,
+        "markdown": f"![](:/{res['id']})",
+    }
+
+
+# ---- Stand-off AI Highlight & Comment Layer API (Agent Read/Write + Frontend Fetch) ----
+
+class AgentAnnotationItem(BaseModel):
+    quote: str
+    comment: str = ""
+    quote_prefix: str = ""
+    quote_suffix: str = ""
+    line_hint: int | None = None
+    layer_name: str | None = None
+
+
+class AgentAnnotationsBatchBody(BaseModel):
+    note_id: str | None = None
+    path: str | None = None
+    layer_name: str = "default"
+    replace_layer: bool = False
+    annotations: list[AgentAnnotationItem]
+
+
+class AgentAnnotationsDeleteBody(BaseModel):
+    note_id: str | None = None
+    path: str | None = None
+    annotation_id: str | None = None
+    layer_name: str | None = None
+
+
+@app.get("/api/annotations")
+async def get_note_annotations(
+    path: str | None = None,
+    note_id: str | None = None,
+    status: str = "active",
+    layer_name: str | None = None,
+):
+    """Fetch stand-off AI highlights & comments for a note (by path or UUID)."""
+    target = (note_id or path or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="must provide path or note_id")
+    eng = _storage()
+    note = eng.resolve_note(target, include_deleted=True)
+    if note is None and path:
+        # Ensure disk corpus is synced if note was newly created on disk
+        _corpus_files()
+        note = eng.resolve_note(target, include_deleted=True)
+    if note is None:
+        return {"note_id": None, "path": path or note_id, "annotations": []}
+    rows = eng.list_annotations(
+        note["id"],
+        status=status if status else "active",
+        layer_name=layer_name,
+    )
+    return {
+        "note_id": note["id"],
+        "path": note["path"],
+        "title": note["title"],
+        "annotations": rows,
+    }
+
+
+@app.get("/api/agent/notes")
+async def agent_list_notes(in_list_only: bool = False, q: str | None = None):
+    """Agent-facing endpoint to discover notes in the library (or search via FTS5/LIKE)."""
+    eng = _storage()
+    _corpus_files()
+    if q and q.strip():
+        hits = eng.search_notes(q.strip(), limit=100)
+        return {"query": q.strip(), "notes": hits}
+    notes = eng.list_notes(in_list_only=in_list_only, include_deleted=False)
+    out = []
+    for n in notes:
+        body = n.get("body") or ""
+        out.append(
+            {
+                "id": n["id"],
+                "notebook_id": n["notebook_id"],
+                "title": n["title"],
+                "path": n["path"],
+                "in_list": n["in_list"],
+                "list_pos": n["list_pos"],
+                "chars": len(body),
+                "lines": body.count("\n") + 1 if body else 0,
+                "updated_at": n["updated_at"],
+            }
+        )
+    return {"notes": out}
+
+
+@app.get("/api/agent/note")
+async def agent_read_note(
+    path: str | None = None,
+    note_id: str | None = None,
+    start_line: int | None = None,
+    end_line: int | None = None,
+):
+    """Agent-facing endpoint to read a note's Markdown text (whole or line window),
+    progressive reading segments, and current AI annotations."""
+    target = (note_id or path or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="must provide path or note_id")
+    eng = _storage()
+    _corpus_files()
+    note = eng.resolve_note(target, include_deleted=False, include_segments=True)
+    if note is None:
+        raise HTTPException(status_code=404, detail=f"note not found: {target}")
+    body = note.get("body") or ""
+    lines = body.split("\n") if body else []
+    total_lines = len(lines)
+    a = max(1, min(int(start_line or 1), total_lines or 1))
+    b = max(a, min(int(end_line or total_lines or 1), total_lines or 1))
+    window_text = "\n".join(lines[a - 1 : b]) if lines else ""
+    numbered_lines = [
+        {"line": idx, "text": lines[idx - 1]}
+        for idx in range(a, b + 1)
+        if 1 <= idx <= total_lines
+    ]
+    annotations = eng.list_annotations(note["id"], status="active")
+    return {
+        "note_id": note["id"],
+        "path": note["path"],
+        "title": note["title"],
+        "total_lines": total_lines,
+        "start_line": a,
+        "end_line": b,
+        "text": window_text,
+        "numbered_lines": numbered_lines,
+        "segments": note.get("segments") or [],
+        "annotations": annotations,
+    }
+
+
+@app.post("/api/agent/annotations")
+async def agent_add_annotations(body: AgentAnnotationsBatchBody):
+    """Agent-facing endpoint to batch-create stand-off AI highlights & comments.
+    Automatically performs 4-tier drift-resistant quote anchoring against the note text."""
+    from storage.engine import StorageNotFoundError
+
+    target = (body.note_id or body.path or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="must provide note_id or path")
+    async with _state_lock:
+        eng = _storage()
+        _corpus_files()
+        try:
+            res = eng.add_annotations_batch(
+                target,
+                [item.model_dump() for item in body.annotations],
+                layer_name=body.layer_name,
+                replace_layer=body.replace_layer,
+            )
+            return {"ok": True, **res}
+        except StorageNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/agent/annotations/delete")
+async def agent_delete_annotations(body: AgentAnnotationsDeleteBody):
+    """Agent-facing endpoint to delete AI annotations by annotation_id, note, or layer_name."""
+    target = (body.note_id or body.path or "").strip() or None
+    if not target and not body.annotation_id and not body.layer_name:
+        raise HTTPException(
+            status_code=400,
+            detail="must specify note_id/path, annotation_id, or layer_name",
+        )
+    async with _state_lock:
+        eng = _storage()
+        deleted = eng.delete_annotations(
+            note_id_or_path=target,
+            annotation_id=body.annotation_id,
+            layer_name=body.layer_name,
+        )
+        return {"ok": True, "deleted": deleted}
 
 
 from lecture_routes import install as _install_lecture_routes

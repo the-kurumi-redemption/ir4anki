@@ -1,6 +1,14 @@
 import { Component, createEffect, createSignal, onCleanup } from 'solid-js'
 import { acquireDocument, invalidateDocuments, observeDocuments } from '../lib/file-cache'
+import {
+  aiLayerEnabled,
+  applyAiLayer,
+  fetchNoteAnnotations,
+  invalidateAiAnnotations,
+  observeAiAnnotations,
+} from '../lib/ai-layer'
 import { sourceScroll, type SourceScrollSession } from '../lib/source-scroll'
+import type { AiAnnotation } from '../types'
 
 // Shared whole-file markdown viewer with source-line anchoring.
 // Extracted from NotePanel (2026-09-19, 渐进制卡) so the card→note panel and
@@ -20,7 +28,10 @@ import { sourceScroll, type SourceScrollSession } from '../lib/source-scroll'
 // wrapper lets its source alignment session observe asynchronous layout changes. File texts are cached module-wide (same cache NotePanel
 // used) so tab/panel switches never re-fetch.
 
-export const invalidateFileCache = invalidateDocuments
+export const invalidateFileCache = (path?: string) => {
+  invalidateDocuments(path)
+  invalidateAiAnnotations(path)
+}
 
 interface Props {
   /** corpus-relative path; null renders nothing */
@@ -81,6 +92,7 @@ export const FileViewer: Component<Props> = (props) => {
   const [error, setError] = createSignal('')
   const [retry, setRetry] = createSignal(0)
   const [invalidated, setInvalidated] = createSignal(0)
+  const [aiAnns, setAiAnns] = createSignal<AiAnnotation[]>([])
   let release: (() => void) | undefined
   let alive = true
   let rootRef: HTMLDivElement | undefined
@@ -99,12 +111,16 @@ export const FileViewer: Component<Props> = (props) => {
     if (!path) {
       setError('')
       setHtml('')
+      setAiAnns([])
       setLoading(false)
       return
     }
     setHtml('')
     setError('')
     setLoading(true)
+    fetchNoteAnnotations(path).then(list => {
+      if (alive && token === reqToken) setAiAnns(list)
+    })
     const request = acquireDocument(path, props.revision, props.fetchFile)
     release = request.release
     request.promise.then(d => {
@@ -134,6 +150,17 @@ export const FileViewer: Component<Props> = (props) => {
     invalidated()
     props.reloadToken // track: in-app edit bumped it → re-fetch fresh text
     load()
+  })
+
+  createEffect(() => {
+    const h = html()
+    const list = aiAnns()
+    const enabled = aiLayerEnabled()
+    if (!h) return
+    queueMicrotask(() => {
+      if (!alive || !contentRef) return
+      applyAiLayer(contentRef, list, enabled)
+    })
   })
 
   // Target ownership is independent of tab visibility: only a new target or
@@ -177,11 +204,21 @@ export const FileViewer: Component<Props> = (props) => {
   const unsubscribe = observeDocuments(path => {
     if (!path || props.path === path || props.path?.startsWith(path + '/')) setInvalidated(n => n + 1)
   })
+  const unsubAi = observeAiAnnotations(path => {
+    if (!path || props.path === path || props.path?.startsWith(path + '/')) {
+      if (props.path) {
+        fetchNoteAnnotations(props.path).then(list => {
+          if (alive) setAiAnns(list)
+        })
+      }
+    }
+  })
   onCleanup(() => {
     alive = false
     reqToken++
     release?.()
     unsubscribe()
+    unsubAi()
     scrollSession?.dispose()
   })
 
