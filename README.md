@@ -1,208 +1,370 @@
-# ir4anki
+<div align="center">
 
-在本地 Markdown 阅读中手工制卡，用 Anki 原生调度复习。
-面向单一使用者，优先支持 Debian/Linux；安装后可离线阅读、制卡和复习。
-前端资源、公式渲染和媒体由本机提供，同步才需要连接配置的服务器。
+<img src="flutter_app/linux/assets/dev.ir4anki.ir4anki_desktop.svg" width="112" height="112" alt="IR4Anki Logo" />
 
-新安装脚本默认使用官方 **Anki pylib**，无需打开桌面 Anki。
-直接运行后端而未设置 `ANKI_BACKEND` 时仍走 `connect` 兼容路径；已有配置也不会被安装脚本覆盖。
-pylib 使用集合本身的调度配置，是否启用 FSRS 取决于集合设置，不能由后端类型推断。
+# IR4Anki
 
-## 日常使用
+**基于 Flutter（Material Design 3 Expressive）与官方 Anki `pylib` 引擎的原生桌面渐进阅读与间隔重复工作台**
 
-- **学习**：点击「开始」，一次领取阅读片段和待复习卡，按数量均匀交错推进。
-- **文件**：浏览语料、上传文件或文件夹、重命名、移动和永久删除。
-- **阅读**：维护加入阅读的文件及进度；阅读独立于 Anki 卡片调度，没有 FSRS 到期日。
+*Incremental Reading meets Native Anki FSRS — Offline-first, SQLite + FTS5, Stand-off AI Highlights, Zero Browser Overhead.*
 
-每个阅读文件起初是一整个片段，每轮最多领取两个可处理片段。
-选择行后分割只采用书签语义：选中内容形成子片段，值得保留的未读尾部留待后续轮次。
-分割不改写 Markdown 原文；子片段接替父片段在本轮中的位置，单纯分割不会提前开始下一组复习。
-复习卡可通过溯源返回制卡时的原文片段，关闭溯源后回到当前学习进度。
+<p>
+  <a href="flutter_app/"><img src="https://img.shields.io/badge/Flutter-Desktop%20M3E-02569B?style=flat-square&logo=flutter&logoColor=white" alt="Flutter Desktop M3E" /></a>
+  <a href="backend/"><img src="https://img.shields.io/badge/Anki%20pylib-25.2.7%20%7C%20FSRS-00897B?style=flat-square&logo=anki&logoColor=white" alt="Anki pylib FSRS" /></a>
+  <a href="backend/"><img src="https://img.shields.io/badge/Backend-FastAPI%20%2B%20SQLite%20FTS5-3776AB?style=flat-square&logo=fastapi&logoColor=white" alt="FastAPI + SQLite FTS5" /></a>
+  <a href="scripts/agent_layer.py"><img src="https://img.shields.io/badge/AI%20Layer-Stand--off%20Highlights-D97706?style=flat-square" alt="Stand-off AI Layer" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0--or--later-6750A4?style=flat-square" alt="License AGPL-3.0" /></a>
+</p>
 
-阅读时可手工添加问答卡或 Cloze，编辑器支持 Markdown、公式、图片和预览。
-已有 HTML 卡保持兼容。制卡来源保存在本地阅读状态中；原文或笔记已变化时，
-编辑器拒绝过期覆盖并保留草稿，重新打开后可手工合并。
-请使用集合中真实存在的问答/Cloze 笔记类型，字段和模板需匹配用途。
+<p>
+  <a href="#核心特性">核心特性</a> ·
+  <a href="#界面预览">界面预览</a> ·
+  <a href="#系统架构">系统架构</a> ·
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#ai-agent-划重点工作流">AI 划重点</a> ·
+  <a href="#键盘快捷键">快捷键</a> ·
+  <a href="#配置与运维">配置与运维</a>
+</p>
 
-「制卡完成」、跳过和继续会推进阅读位置，复习则使用原生评分结果。
-阅读和复习分别显示进度；缺失、挂起或离开复习范围的卡不冒充已作答。
-「结束阅读」保留未处理片段供以后阅读，继续本轮卡片；「退出本轮」清除本轮队列并提交当前撤销位置。
-这两个动作不会强制同步。
+<br />
 
-### 预览池与每日默认值
+<img src="docs/assets/screenshots/01-reading-ai-layer.png" alt="IR4Anki 渐进阅读工作台与 AI 旁路划重点图层" width="100%" />
 
-安装脚本生成的配置开启阅读和预览池。直接运行后端时，这两个功能需要显式开启。
-预览池是新卡隔夜放行门槛，并非逐卡人工审批：新制卡先挂起在 `预览池`，
-到了下一个 Anki 日后，在进入学习等入口按额度自动放入目标牌组 `2026`。
+<sub>渐进阅读双栏工作台：左栏展示行圆点无损切分、KaTeX 公式与 AI 暖琥珀荧光高亮/考点批注条；右栏实时联动整篇上下文与关联卡片。</sub>
 
-| 配置 | 当前默认行为 |
-| --- | --- |
-| `ANKI_RELEASE_DAILY_GOAL=36` | 每日最多自动放行 36 张；更早的卡优先 |
-| `ANKI_DAILY_NEW=0` | 每轮领取全部可领取新卡；0 表示不另加数量上限 |
-| `ANKI_REVIEW_DUE_DIVISOR=1` | 本日首次领取时记录到期量，默认覆盖整批到期卡 |
-| `ANKI_ROLLOVER_HOUR=4` | 本地时间凌晨 4 点换日，应与集合设置一致 |
-| `ANKI_REVIEW_DECK=` | 空值覆盖全部牌组；指定牌组时包含其子牌组 |
+</div>
 
-36 是自动放行预算，不是总复习量或阅读制卡配额。
-阅读量由加入的文件和片段状态决定。详见[交错学习](docs/interleaved-flow.md)、
-[书签分割](docs/bookmark-reading.md)和[复习牌组范围](docs/review-deck-scope.md)。
+---
 
-### 文件操作
+## 为什么选择 IR4Anki？
 
-工具栏直接提供「导入文件」与「导入文件夹」。文件夹导入保留所选文件夹及子目录，
-书籍内部的 `_assets` 图片可随正文导入；`manifest.json` 等不支持的文件会跳过并列出原因。
-系统配置目录及语料库根级的编辑器 `_assets` 仍受保护。详见[文件夹导入](docs/folder-import.md)。
+SuperMemo 开创的**渐进阅读（Incremental Reading）**将长文拆解、摘录与主动回忆融为一体，却受限于封闭生态与传统界面；而在日常使用 Markdown 笔记库 + Anki 时，阅读与制卡割裂，往往读完一整章仍未沉淀出可长期复习的记忆卡片。
 
-上传先检查路径、编码、冲突和大小：默认最多 100 个文件、单文件 25 MiB、整批 100 MiB，
-改写后的 Markdown 也受限。同批图片按相对路径关联；I/O 故障仍可能部分完成，
-请核对完成回执后再重试。
+**IR4Anki** 致力于把「深度阅读」与「科学记忆」重新合二为一：
 
-移动与重命名会协调阅读索引和溯源位置；冲突、路径越界及不安全的符号链接会被拒绝。
-永久删除要求确认文件名，已加入阅读的文件会额外提醒进度影响。
-删除语料不等于删除已生成的 Anki 卡片；重要原文请另做备份。
+- **无需离开当前语境**：在一张桌面窗口中完成长文切分、重点批注、即时制卡与 FSRS 复习。
+- **彻底原生，离线优先**：采用 **Flutter 原生桌面客户端**直连本机 **Anki `pylib` 引擎**与 **SQLite 单一事实源**，无需浏览器、无需常驻桌面版 Anki，公式渲染、图片沙箱与全文检索全部 100% 本地运行。
+- **数据完全归你所有**：直接复用你的官方 `collection.anki2`（完整保留原生 FSRS 调度参数）与标准 Markdown 笔记，不绑定任何专有云服务。
 
-## 安装
+> [!NOTE]
+> **客户端路线说明**：IR4Anki 已全面转向 **Flutter 原生桌面应用（[`flutter_app/`](flutter_app/)）** 作为唯一主线，彻底抛弃浏览器 Web 端开发。仓库中历史遗留的 [`frontend/`](frontend/) 目录已停止演进，仅作归档保留。
 
-需要 Python ≥3.10、可用的 Python venv/pip、Git、npm，以及 **Node 20.19+（20 系列）或 22.12+**。
-当前锁定的 Vite 8 不支持旧 Node 18；安装脚本只检查主版本 ≥18，不能代替此要求。
-Debian 可先安装 `python3-venv` 等系统依赖，并自行准备符合要求的 Node。
+---
 
-后端固定使用 `anki==25.2.7` 和 `markdown-it-py==4.0.0`；全部运行依赖见
-[requirements.txt](backend/requirements.txt)。不要只更新前端或漏装解析器依赖。
+## 核心特性
 
-先在兼容版本的桌面 Anki 中准备好现有集合、笔记类型和媒体，再完全关闭桌面 Anki。
-pylib 不会替你创建空集合；同一集合只能交给一个进程、一个 worker 持有。
-不要让桌面 Anki 与服务同时打开集合，也不要让测试实例指向真实集合。
+### 1. Material Design 3 Expressive 原生桌面体验
+- **动态表达力设计语言**：内置 4 套 Vibrant 动态配色方案（`极光紫` / `青岚绿` / `暖陶橙` / `深海蓝`）、浅色 / 深色 / 跟随系统模式，以及可切换的 Expressive / Standard 弹簧物理动效体系。
+- **60fps 流畅长文渲染**：虚拟化 Markdown 渲染引擎 + 原生 KaTeX 数学公式（`flutter_math_fork`）+ `ValueNotifier` 零正文重建划词交互。
+- **一等公民 Linux 桌面集成**：单实例窗口唤醒、独立桌面图标与 `.desktop` 启动器、终端一键 `ir4anki` 启动。
+
+### 2. 单流每日交错学习（`even-floor-v1`）
+- **一天只做一轮**：将待读片段与 FSRS 到期卡/新卡按比例均匀交错推进（读一段 → 复习一组卡 → 循环），兼顾输入节奏与记忆巩固。
+- **预览池隔夜放行（Preview Pool）**：当日新制卡片先挂起于预览池，次日换日后按每日配额（默认 36 张）自动放行进入目标牌组，避免单日复习量雪崩。
+
+### 3. 整文播种与「行圆点」无损书签切分
+- **原文零改写**：加入阅读清单的 Markdown 文档以整篇作为根节点；阅读时点击左侧行圆点即可框选任意行区间，递归切分为待制卡子片段，底层原文一字不改。
+- **渐进消化**：子片段接替当前阅读位置，未读尾部自动顺延至后续轮次，无需在阅读前手动拆文件。
+
+### 4. 非模态悬浮制卡 + 严格防剧透守卫
+- **不遮挡阅读上下文**：问答卡 / 挖空卡（Cloze）编辑抽屉以非模态方式浮于右栏，左栏正文始终可滚动、可复制；选中文本按 `C` 或在编辑器按 `Ctrl+Shift+C` 即可一键生成 `{{c1::...}}` 挖空，支持正反面 Markdown + KaTeX 实时预览与本地插图。
+- **防剧透守卫（Answer-Leak Guard）**：复习卡片翻面前严格遮蔽右栏辅助参考区；翻面后自动解锁，支持一键**原文溯源**直达制卡片段，并在 4 个评分按钮上直显 FSRS 下次间隔预测及 `S / D / R` 记忆状态徽章。
+
+### 5. AI 旁路划重点与批注图层（原文零污染）
+- **Stand-off 架构**：AI 高亮与块级考点批注条独立存储在 SQLite `ai_annotations` 表中，绝不往 Markdown 正文写入脏标记，不干扰切片指纹与划词挖空；左栏工具栏支持一键显隐。
+- **四级抗编辑漂移自愈引擎**：当原文发生编辑时，自动依次执行 **精确匹配 → Markdown/标点骨架映射 → 上下文夹逼 → K-mer 局部模糊对齐** 重新锚定；若对应段落被删后又回滚恢复，批注会自动自愈。
+- **原生面向 AI Agent**：提供 [`scripts/agent_layer.py`](scripts/agent_layer.py) CLI 与 REST API，可接入任意 Coding/Study Agent 对语料批量划重点。
+
+### 6. Storage v2 现代存储与三栏文件工作台
+- **SQLite 单一事实源 + 媒体沙箱**：所有笔记、切片、溯源与版本历史统一收敛至 `data.db`，图片以 SHA-256 去重后存放在 `media/` 沙箱并通过 `![](:/<resource_id>)` 引用。
+- **完整的知识库管理**：
+  - **FTS5 全文检索**：内置 Trigram + CJK 短词回退检索与高亮摘要预览。
+  - **历史版本时间旅行**：每次编辑或覆盖前自动留存快照，支持预览与一键回滚。
+  - **安全回收站**：软删除的笔记与文件夹可随时恢复，且**即使原文进入回收站，已创建的 Anki 卡片仍可完整溯源**。
+  - **事务性批量导入（InteropService）**：支持文件/整文件夹连同相对路径图片原子导入，内置 `skip` / `rename` / `overwrite` 冲突解决策略。
+
+### 7. 官方 Anki `pylib` 引擎 & 本地数据安全
+- **无头原生驱动**：默认直连官方 `anki==25.2.7`（同时兼容 AnkiConnect 桌面模式），完整复用你的集合模板、媒体目录与 FSRS 参数。
+- **持久化撤销与受控同步**：最近一次评分通过 Answer Journal 跨重启持久化可撤销；默认采用手动确认同步策略，仅连接你显式配置的自建同步服务器，绝不隐式回退或自动覆盖全量同步。
+
+---
+
+## 界面预览
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/screenshots/02-authoring-drawer.png" alt="非模态悬浮制卡抽屉" />
+      <p align="center"><b>非模态悬浮制卡抽屉（青岚绿 · 浅色）</b><br /><sub>左栏原文始终可读可复制，右栏即时编辑 Cloze/QA 卡片并实时预览正反面与 KaTeX 公式</sub></p>
+    </td>
+    <td width="50%">
+      <img src="docs/assets/screenshots/03-review-fsrs.png" alt="FSRS 复习与原文溯源" />
+      <p align="center"><b>FSRS 复习与卡片原文溯源（深海蓝 · 浅色）</b><br /><sub>直显 S/D/R 记忆状态与 4 档预测下次间隔，翻面后右栏自动定位制卡出处与高亮上下文</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/screenshots/04-files-workbench-dark.png" alt="深色模式三栏文件工作台" />
+      <p align="center"><b>三栏文件工作台（青岚绿 · 深色模式）</b><br /><sub>目录树、阅读清单进度、FTS5 全文检索、历史版本回滚、回收站与批量导入一站集成</sub></p>
+    </td>
+    <td width="50%">
+      <img src="docs/assets/screenshots/05-start-dashboard.png" alt="每日单流学习驾驶舱" />
+      <p align="center"><b>每日单流学习驾驶舱（暖陶橙 · 浅色）</b><br /><sub>清晰呈现今日阅读计划、FSRS 待复习/新卡数量与预览池明日放行额度，一键开启本轮</sub></p>
+    </td>
+  </tr>
+</table>
+
+---
+
+## 系统架构
+
+```mermaid
+flowchart LR
+    subgraph Desktop["Flutter 原生桌面客户端 (flutter_app/)"]
+        UI["M3E 界面 · 虚拟化 Markdown & KaTeX<br/>非模态制卡 · 防剧透守卫 · 三栏工作台"]
+        State["AppController & API Client"]
+        UI <--> State
+    end
+
+    subgraph Engine["本地 Python 引擎 (backend/ · 127.0.0.1:8901)"]
+        API["FastAPI 单 Worker 服务"]
+        Flow["单流交错调度 (even-floor-v1)<br/>预览池放行 · Answer Journal 撤销"]
+        Anki["Anki pylib 25.2.7<br/>(FSRS / 兼容 AnkiConnect)"]
+        Storage["StorageEngine v2<br/>SQLite data.db + FTS5 + media/"]
+        Interop["InteropService<br/>两阶段校验 · 事务导入"]
+        AILayer["AI 旁路图层<br/>四级抗漂移自愈锚定"]
+        API --> Flow
+        API --> Anki
+        API --> Storage
+        API --> Interop
+        API --> AILayer
+        Interop --> Storage
+        AILayer --> Storage
+    end
+
+    subgraph Agent["外部 AI Agent / 自动化"]
+        CLI["scripts/agent_layer.py CLI<br/>HTTP API 或离线直连 data.db"]
+    end
+
+    State <-->|"Loopback HTTP / JSON"| API
+    CLI <-->|"REST API / SQLite"| API
+```
+
+### 仓库结构
+
+```text
+ir4anki/
+├── flutter_app/         # Flutter 原生桌面客户端（Material Design 3 Expressive，当前主线）
+│   ├── lib/
+│   │   ├── screens/     # 学习驾驶舱、双栏工作台、三栏文件工作台、同步与设置
+│   │   ├── widgets/     # M3E 组件库、虚拟化 Markdown/KaTeX、制卡抽屉、AI 高亮渲染
+│   │   ├── services/    # API 客户端、Cloze 解析、行切分引擎、AI 图层匹配引擎
+│   │   └── theme/       # M3E 配色、弹簧物理动效、30 级排版体系
+│   └── run-desktop.sh   # Release 构建与 Linux 原生系统应用一键安装脚本
+├── backend/             # FastAPI 本地引擎 + 官方 Anki pylib 25.2.7 集成
+│   ├── storage/         # Storage v2（SQLite 单一事实源、FTS5、版本历史、回收站、媒体沙箱）
+│   ├── interop/         # Joplin 式模块化导入框架（两阶段校验 + 事务落盘）
+│   └── app.py           # 核心 API、单流交错调度与防冲突守卫
+├── scripts/             # AI Agent 划重点 CLI (agent_layer.py) 及自动化测试套件
+├── deploy/              # systemd 用户服务模板、配置示例、离线快照备份与检查脚本
+└── docs/                # 设计文档、迁移手册与截图资源
+```
+
+---
+
+## 快速开始
+
+### 环境要求
+
+| 组件 | 要求 | 说明 |
+| --- | --- | --- |
+| **操作系统** | Linux 桌面环境（Debian / Ubuntu / Arch / Fedora 等） | Flutter GTK3 原生桌面构建，需要 `clang`、`cmake`、`ninja-build`、`pkg-config`、`libgtk-3-dev` |
+| **Python** | `>= 3.10`（含 `venv` 或 `uv`） | 后端固定依赖 `anki==25.2.7`、`fastapi`、`markdown-it-py==4.0.0` |
+| **Flutter SDK** | `>= 3.24`（Dart SDK `^3.8.0`） | 用于编译独立 Release 桌面二进制 |
+| **Anki 集合** | 已有 `collection.anki2` | 建议先在桌面版 Anki 中准备好牌组与问答/填空笔记类型，**启动原生引擎前完全关闭桌面 Anki** |
+
+> [!IMPORTANT]
+> `pylib` 模式直接接管 `collection.anki2`：同一集合**同一时刻只能由一个进程、单个 worker 打开**。启动 IR4Anki 后端前请确认桌面版 Anki 已彻底退出，切勿让测试实例指向你的生产集合。
+
+### 第一步：配置并启动本地后端引擎
 
 ```bash
 git clone https://github.com/Mifune-Shioriko/ir4anki.git
 cd ir4anki
-bash deploy/install.sh --collection /absolute/profile/collection.anki2
+
+# 1. 创建 Python 虚拟环境并安装后端依赖（推荐使用 uv，也可用 python3 -m venv + pip）
+python3 -m venv backend/.venv
+backend/.venv/bin/pip install -r backend/requirements.txt
+
+# 2. 生成本机私有配置（权限 600，切勿提交到仓库）
+install -m 600 deploy/ir4anki.env.example ~/.config/ir4anki.env
 ```
 
-安装脚本会安装后端依赖、询问路径、构建前端，并安装、启用及重启 systemd 用户服务。
-新配置写到 `~/.config/ir4anki.env`，权限为 600；已有文件原样保留，
-`--backend` 和 `--collection` 不会改写已有文件里的选择。
-默认访问地址为 `http://127.0.0.1:8901`。
-
-其他安装参数：
-
-```bash
-bash deploy/install.sh --help
-# 仅安装和构建，不操作服务；仍会创建配置、安装依赖
-bash deploy/install.sh --no-service --non-interactive --collection /absolute/profile/collection.anki2
-# 可选桌面兼容路径
-bash deploy/install.sh --backend connect
-```
-
-`--non-interactive` 采用默认值，首次原生安装仍需有效的集合路径。
-Connect 模式要求桌面 Anki 正在运行并安装 AnkiConnect，默认地址 `http://127.0.0.1:8765`；
-其同步由桌面 Anki 管理，原生备份、持久撤销和管理能力不可直接照搬。
-
-### 配置与网络边界
-
-按[配置示例](deploy/ir4anki.env.example)编辑本机配置，不要把口令提交到仓库。
-示例仍以 `connect` 开头；原生安装应明确设置 `ANKI_BACKEND=pylib`。
-下面仅展示关键项，路径必须为绝对路径，不能用 `~`：
+编辑 `~/.config/ir4anki.env`，填入绝对路径（不要使用 `~`）：
 
 ```ini
 IR4ANKI_HOST=127.0.0.1
 IR4ANKI_PORT=8901
 ANKI_BACKEND=pylib
-ANKI_COLLECTION_PATH=/absolute/profile/collection.anki2
-ANKI_MEDIA_DIR=/absolute/profile/collection.media
-ANKI_STATE_DIR=/absolute/ir4anki-state
-ANKI_NOTES_DIR=/absolute/markdown-corpus
-ANKI_BACKUP_DIR=/absolute/ir4anki-backups
+ANKI_COLLECTION_PATH=/home/yourname/.local/share/Anki2/User 1/collection.anki2
+ANKI_MEDIA_DIR=/home/yourname/.local/share/Anki2/User 1/collection.media
+ANKI_STATE_DIR=/home/yourname/.local/state/ir4anki
+ANKI_NOTES_DIR=/home/yourname/anki-notes
+ANKI_BACKUP_DIR=/home/yourname/.local/state/ir4anki/anki-backups
 ANKI_ADD_MODEL=问答题
 ANKI_ADD_CLOZE_MODEL=填空题
 ANKI_READING_MODE=1
 ANKI_PREVIEW_MODE=1
 ```
 
-用户服务从配置文件加载环境，使用单 worker。检查配置：
+验证配置并启动本地引擎（单 worker）：
 
 ```bash
+# 校验配置与集合路径
 backend/.venv/bin/python deploy/native.py check --env "$HOME/.config/ir4anki.env" --require-offline
-systemctl --user status ir4anki
-journalctl --user -u ir4anki -n 40
+
+# 方式 A：直接前台启动（适合快速试用）
+set -a && source ~/.config/ir4anki.env && set +a
+backend/.venv/bin/python -m uvicorn --app-dir backend app:app --host "$IR4ANKI_HOST" --port "$IR4ANKI_PORT" --workers 1
+
+# 方式 B：注册为 systemd 用户常驻服务（开机自启，参考 deploy/ir4anki.service）
+mkdir -p ~/.config/systemd/user
+sed "s|@REPO@|$PWD|g" deploy/ir4anki.service > ~/.config/systemd/user/ir4anki.service
+systemctl --user daemon-reload && systemctl --user enable --now ir4anki
 ```
 
-桌面浏览器使用 localhost/回环 IP 时无需额外 Host 配置。手机、局域网或 Tailscale 访问时，
-需设置监听地址（例如 `IR4ANKI_HOST=0.0.0.0`），并明确配置
-`ANKI_TRUSTED_HOSTS=review.example.ts.net,100.100.1.2` 为实际访问的服务器主机名/IP，
-不带协议、端口或通配符。监听所有接口会扩大可达范围，应同时限制网络访问。
-页面与 API 必须同源，反向代理也需保持正确的 Host/Origin。
-Host 白名单、同源和 Fetch-Metadata 检查防止一类浏览器跨站请求，**不是非浏览器多用户认证**。
-服务应限制在可信本机、私网或受控 VPN 边界内，不应直接暴露给公网多人使用。
-
-## 撤销与同步
-
-原生模式保留最近一次评分的持久撤销位置，重启后仍可撤销；下一次评分会结束上一次撤销位置。
-撤销只恢复该次评分和相关队列计数，不回滚阅读、已编辑字段或新制卡。
-检测到不相容的集合/调度外部变化时会拒绝不安全恢复。
-
-默认 `ANKI_SYNC_POLICY=manual`：启动、评分、制卡和阶段切换不自动联网同步。
-明确确认手动同步会先结束当前撤销位置，即使随后联网失败也不应期待该位置仍可撤销。
-有未决撤销时，保留的后台同步兼容策略会推迟同步。
-
-界面的手动同步只允许**直接访问 loopback、同源浏览器请求**，同时核验连接来源、Host、Origin 和确认头。
-经反向代理、局域网或 VPN 访问页面不自动获得该权限，转发头也不能证明本机身份。
-管理用原生统计、备份、导出和 `/api/engine/sync` 则使用本地配置的
-`ANKI_ENGINE_API_TOKEN` bearer；不要把管理令牌嵌入公开页面或分享给其他使用者。
-
-原生同步必须显式配置自己的服务器 `ANKI_SYNC_ENDPOINT`，并在本机设置
-`ANKI_SYNC_HKEY`，或 `ANKI_SYNC_USERNAME` / `ANKI_SYNC_PASSWORD`。
-只使用自己的账户，不会隐式回退到 AnkiWeb。
-遇到需要全量同步时，应用拒绝自行决定上传/下载方向；先备份，再用兼容的桌面 Anki 人工处理。
-切换桌面前须停止原生服务，详见[迁移与应急处理](docs/pylib-migration.md)。
-
-## 备份与升级
-
-集合与 `collection.media` 保存卡片和媒体；`ANKI_STATE_DIR` 保存阅读进度、溯源、轮次和额度，
-`ANKI_NOTES_DIR` 保存 Markdown 语料。Anki 同步不等于阅读状态与语料同步。
-跨机器迁移需整体处理这些数据，不能仅复制集合后假设阅读进度仍在。
-
-原生集合有启动及周期备份（默认间隔 1800 秒）；它不能替代媒体、语料和阅读状态的完整备份。
-升级前先决定撤销或明确提交最后一次答案；不要删除答案 journal 来绕过检查。
-关闭桌面 Anki，停止服务后使用完整离线快照，输出目录必须在源数据目录之外：
+### 第二步：构建并安装 Flutter 原生桌面客户端
 
 ```bash
+# 编译 Release 桌面包并安装为系统原生应用
+# 自动部署至 ~/.local/share/ir4anki-desktop/、~/.local/bin/ir4anki 与系统应用启动器
+./flutter_app/run-desktop.sh --install-app --rebuild
+
+# 直接启动（或从 KDE / GNOME 应用菜单搜索 "IR4Anki" 打开）
+ir4anki
+```
+
+首次启动后，客户端默认连接 `http://127.0.0.1:8901`。你也可以在左侧导航栏 **「同步与设置」** 中修改后端地址、切换 4 套 M3E 动态配色、调整深浅色主题与弹簧动效风格。
+
+---
+
+## AI Agent 划重点工作流
+
+IR4Anki 内置专为 AI Agent 设计的旁路精读图层，既支持连接运行中的本机服务，也支持离线直接读写 SQLite `data.db`：
+
+```bash
+# 1. 搜索或列出语料库中的笔记
+python3 scripts/agent_layer.py notes --query "FSRS"
+
+# 2. 读取笔记指定行范围及已有批注
+python3 scripts/agent_layer.py read --note "认知科学/间隔重复与 FSRS 模型.md" --start 1 --end 120
+
+# 3. 写入单条高亮与考点批注（原文零修改，自带四级抗编辑漂移锚定）
+python3 scripts/agent_layer.py add \
+  --note "认知科学/间隔重复与 FSRS 模型.md" \
+  --layer "AI 精读批注" \
+  --quote "可提取度从 100% 衰减至 90% 所需的天数，直接决定下一次复习间隔" \
+  --comment "核心考点：Stability 是 R 降到 90% 的时间间隔，而非半衰期。"
+
+# 4. 批量导入 JSON 批注或清空指定图层
+python3 scripts/agent_layer.py batch --note "认知科学/间隔重复与 FSRS 模型.md" --layer "AI 精读批注" --file highlights.json
+python3 scripts/agent_layer.py clear --note "认知科学/间隔重复与 FSRS 模型.md" --layer "AI 精读批注"
+```
+
+在桌面端阅读或预览该笔记时，点击工具栏荧光笔图标即可一键切换 AI 重点图层显示。
+
+---
+
+## 键盘快捷键
+
+桌面端全流程支持键盘优先操作，减少鼠标往返：
+
+| 场景 | 快捷键 | 动作 |
+| --- | --- | --- |
+| **渐进阅读** | `Space` | 标记当前片段「制卡完成」并推进流程 |
+| **渐进阅读** | `A` | 在右侧呼出非模态「添加问答卡」抽屉 |
+| **渐进阅读** | `C` | 将选中文本自动包裹为 `{{c1::...}}` 并呼出挖空卡抽屉 |
+| **渐进阅读** | `S` / `N` | 无需制卡跳过 / 移至本轮稍后（下一张） |
+| **渐进阅读** | `Esc` | 取消当前行圆点切分选区（溯源模式中再次按下返回复习） |
+| **FSRS 复习** | `Space` | 翻转显示卡片答案（同时解除右栏防剧透锁定） |
+| **FSRS 复习** | `1` / `2` / `3` / `4` | 评分：重来（Again）/ 困难（Hard）/ 良好（Good）/ 容易（Easy） |
+| **复习 / 阅读** | `Ctrl + Z` | 持久化撤销最近一次 Anki 卡片评分 |
+| **制卡抽屉** | `Ctrl + Shift + C` | 将编辑器内选中文本一键包裹为新挖空 |
+| **制卡抽屉** | `Ctrl + Enter` | 保存并提交当前卡片至预览池 / 目标牌组 |
+
+---
+
+## 配置与运维
+
+<details>
+<summary><b>每日学习与预览池默认参数</b></summary>
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `ANKI_RELEASE_DAILY_GOAL` | `36` | 预览池每日最多自动放行的新卡预算（更早制卡优先）；不限制总复习量 |
+| `ANKI_DAILY_NEW` | `0` | 每轮领取的可领取新卡上限；`0` 表示不额外限制 |
+| `ANKI_REVIEW_DUE_DIVISOR` | `1` | 本日首次领取时记录到期量，默认覆盖整批到期卡 |
+| `ANKI_ROLLOVER_HOUR` | `4` | 本地时间凌晨 4 点换日，应与 Anki 集合设置保持一致 |
+| `ANKI_REVIEW_DECK` | *(空)* | 空值覆盖全部牌组；指定牌组名时自动包含其子牌组 |
+| `ANKI_PREVIEW_DECK` | `预览池` | 新制卡片隔夜暂存牌组（启用 `ANKI_PREVIEW_MODE=1` 时生效） |
+| `ANKI_PREVIEW_RELEASE_DECK` | `2026` | 次日自动放行的目标牌组名称 |
+
+</details>
+
+<details>
+<summary><b>同步策略、AnkiConnect 兼容与网络安全边界</b></summary>
+
+- **手动同步优先**：默认 `ANKI_SYNC_POLICY=manual`，启动、评分与制卡不会自动联网。确认手动同步前会先提交当前持久化撤销点；若遇到需要全量同步的情况，引擎会拒绝擅自决定上传/下载方向，提示先备份再使用同版本桌面 Anki 人工处理。
+- **自建同步服务器**：需显式设置 `ANKI_SYNC_ENDPOINT` 以及 `ANKI_SYNC_HKEY`（或 `ANKI_SYNC_USERNAME` / `ANKI_SYNC_PASSWORD`），仅连接你自己的账户，不隐式回退至 AnkiWeb。
+- **AnkiConnect 兼容路径**：若希望继续配合桌面版 Anki 使用，可在 `~/.config/ir4anki.env` 中设置 `ANKI_BACKEND=connect` 与 `ANKICONNECT_URL=http://127.0.0.1:8765`。
+- **单用户安全边界**：默认监听 `127.0.0.1`。如通过局域网或 Tailscale 访问后端，需设置 `IR4ANKI_HOST=0.0.0.0`、`ANKI_TRUSTED_HOSTS=<主机名或IP>`，并配置 `ANKI_ENGINE_API_TOKEN` 用于远程管理与同步接口。**请勿将本服务直接暴露于公网多人使用。**
+
+</details>
+
+<details>
+<summary><b>完整离线备份与恢复（推荐升级前执行）</b></summary>
+
+集合（`collection.anki2` + `collection.media`）存储卡片与卡片媒体，而 `ANKI_STATE_DIR`（`data.db` + `media/`）存储全部 Markdown 语料、渐进阅读进度、溯源关系与 AI 批注。**Anki 同步不会同步阅读状态与语料库**，跨设备迁移或重大升级前请使用内置离线快照工具：
+
+```bash
+# 1. 确认已关闭桌面 Anki 并停止本地服务
 systemctl --user stop ir4anki
+
+# 2. 创建完整离线快照（输出目录必须位于源数据目录之外，且妥善私密保管）
 backend/.venv/bin/python deploy/native.py backup \
   --env "$HOME/.config/ir4anki.env" \
-  --output /absolute/separate-backups --offline-confirmed
+  --output /absolute/path/to/ir4anki-backups \
+  --offline-confirmed
 ```
 
-备份脚本会拒绝活动服务、桌面进程或未决答案日志，并复制集合、媒体、状态、语料和私有配置。
-快照包含凭据，必须私下保管，不要上传 GitHub。另留一份旧源码、依赖版本及可恢复的前端构建。
+备份脚本会自动校验无活跃服务、无桌面 Anki 进程、无未提交答案撤销日志，随后打包集合、媒体、状态库、语料与本机配置。
 
-推荐在独立干净检出中先审阅更新和安装依赖、构建、验收。
-实际升级前确认运行实例已经停止、备份可用，且当前仓库没有未处理修改：
+</details>
+
+---
+
+## 开发与测试
 
 ```bash
-bash deploy/update.sh
+# Flutter 桌面客户端静态分析与单元测试
+cd flutter_app
+flutter analyze --no-fatal-infos
+flutter test
+flutter build linux --release
+
+# Python 后端存储、AI 图层与导入器测试
+cd ..
+backend/.venv/bin/python -m unittest discover -s scripts -p "*_test.py"
 ```
 
-默认脚本拒绝脏仓库，执行 `git pull --ff-only`、安装依赖、构建、保留旧 dist 并重启服务。
-如果远端没有新提交，它会直接退出；若代码已提前拉取，应使用 `--local` 构建当前快照。
-它不会改写本机配置，也没有完整数据回滚事务。
+### 延伸文档
 
-```bash
-# 准备当前代码：依赖需事先在隔离环境装好，不拉取、不部署、不重启
-bash deploy/update.sh --local --no-restart
-```
+- [交错学习流设计](docs/interleaved-flow.md) · [书签式无损切分](docs/bookmark-reading.md) · [非模态制卡抽屉](docs/card-drawer.md)
+- [复习牌组范围说明](docs/review-deck-scope.md) · [文件夹与 Interop 导入架构](docs/file-import-joplin-redesign.md)
+- [离线使用指南](docs/offline-use.md) · [原生 `pylib` 迁移与应急处理](docs/pylib-migration.md) · [原生能力验证](docs/pylib-verification.md)
 
-`--no-restart` 只生成临时前端构建，不更新运行中的依赖或页面。
-依赖须按 `backend/requirements.txt` 在停机或独立环境完整安装。
-前后端必须配套部署：严格编辑版本字段会让旧客户端返回 422；部署后硬刷新所有页面。
-回滚时先停止服务，恢复配套的旧源码、依赖及前端；若需要恢复数据，使用完整离线快照。
-保留旧 dist 不能回滚集合、状态迁移或已发生的同步，也不能撤回已同步到其他设备的数据。
+---
 
-更多说明见[离线使用](docs/offline-use.md)、[原生能力验证](docs/pylib-verification.md)。
+## 开源协议
 
-## 许可
-
-当前版本采用 [GNU AGPL v3 或更新版本](LICENSE)，包含官方 Anki pylib 的相应许可义务。
-向网络使用者提供修改后的服务时，应依 AGPL 第 13 条提供对应源码。
-历史 MIT 授权仍然有效，原版权及第三方声明见 [NOTICE](NOTICE)。
+本项目采用 **[GNU AGPL v3 或更新版本](LICENSE)** 许可协议（包含集成官方 Anki `pylib` 的相应许可义务）。如对外向网络用户提供修改后的服务，请依照 AGPL 第 13 条提供对应源码。历史 MIT 授权仍然有效，版权归属及第三方声明详见 [NOTICE](NOTICE)。

@@ -2,7 +2,7 @@
 
 Standalone native desktop client for **IR4Anki** built in Flutter with **Material Design 3 Expressive (M3E)** design language, running directly as a native Linux desktop application (GTK3) outside the browser.
 
-> **Fallback preserved**: The existing SolidJS web frontend in `../frontend/` remains untouched and continues to serve at `http://127.0.0.1:8901/`.
+> **Primary Client**: IR4Anki has transitioned fully to this standalone Flutter native desktop application. The legacy SolidJS web frontend in `../frontend/` is archived and no longer actively maintained. See the [root README](../README.md) for full documentation and screenshots.
 
 ## Quick Start
 
